@@ -1,5 +1,5 @@
 {
-  "engineVersion": "ffca990",
+  "engineVersion": "950954e",
   "files": {
     "/assets/ChessBoard.46291e70.js": 85785,
     "/assets/ChessBoard.9232dc69.css": 170,
@@ -15,8 +15,8 @@
     "/sw.js": 24054,
     "/wasm/pikafish.data": 51585654,
     "/wasm/pikafish.js": 84341,
-    "/wasm/pikafish.wasm": 732800,
+    "/wasm/pikafish.wasm": 732799,
     "/xiangqiai.html": 14229
   },
-  "updatedAt": "2026-08-31T15:28:07Z"
+  "updatedAt": "2026-08-31T15:35:02Z"
 }
