@@ -13,6 +13,7 @@ env:
 jobs:
   Pikafish-WASM:
     name: Pikafish WASM (multithreaded, NNUE -> .data)
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -118,23 +119,28 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, subprocess
-          from datetime import datetime, timezone
 
           root = ".."
           try:
+              # 版本号/时间都取自 HEAD，保证同一次构建内容确定性，避免机器人反复触发 CI
               version = subprocess.check_output(
-                  ["git", "describe", "--tags", "--always", "--dirty=-dirty"],
+                  ["git", "describe", "--tags", "--always"],
+                  cwd=root, stderr=subprocess.DEVNULL
+              ).decode().strip()
+              updated_at = subprocess.check_output(
+                  ["git", "log", "-1", "--format=%cI", "HEAD"],
                   cwd=root, stderr=subprocess.DEVNULL
               ).decode().strip()
           except Exception:
               version = "dev"
+              updated_at = "unknown"
 
           with open(os.path.join(root, "version.json"), "r") as fh:
               manifest = json.load(fh)
 
           info = {
               "engineVersion": version,
-              "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+              "updatedAt": updated_at,
               "files": {},
           }
           for path in manifest:
