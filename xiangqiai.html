@@ -137,20 +137,29 @@
     <div id="app"></div>
     <!-- built files will be auto injected -->
     <script>
-        // 关于界面底部：显示 引擎版本 / 最近更新时间 / 更新文件及大小 / 缓存文件及大小。
+        // 关于界面底部：只显示 引擎版本（来自引擎 UCI info 消息）和 最后更新时间（北京时间）。
         // 不修改压缩后的前端 bundle，用 MutationObserver 在"关于"对话框打开时注入。
         (function () {
             if (!window.MutationObserver) { return; }
-            var DATA_URL = '/build-info.json';
-            var FALLBACK_URL = '/version.json';
-            var injected = new WeakMap(); // 防止对同一个 DOM 节点重复注入
 
-            function fmtSize(n) {
-                if (n == null || isNaN(n)) { return '—'; }
-                if (n < 1024) { return n + ' B'; }
-                if (n < 1048576) { return (n / 1024).toFixed(1) + ' KB'; }
-                return (n / 1048576).toFixed(2) + ' MB';
-            }
+            var boxes = [];          // 已注入的显示块
+            var engineVersion = null; // 引擎 UCI "id name" 行里报告的版本
+
+            // 引擎的每行输出被前端 bundle 以 " > " 前缀打到 console，
+            // 其中 "id name Pikafish ..." 就是引擎自己报告的版本信息。
+            (function () {
+                var orig = console.log;
+                console.log = function () {
+                    try {
+                        var s = Array.prototype.join.call(arguments, ' ');
+                        if (s.indexOf(' > id name ') === 0) {
+                            engineVersion = s.slice(' > id name '.length).trim();
+                            rerenderAll();
+                        }
+                    } catch (e) { /* 忽略 */ }
+                    return orig.apply(console, arguments);
+                };
+            })();
 
             function esc(s) {
                 return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -158,110 +167,37 @@
                 });
             }
 
-            function fetchJSON(url) {
-                return fetch(url, { cache: 'no-store' }).then(function (r) {
-                    if (!r.ok) { throw new Error('HTTP ' + r.status); }
-                    return r.json();
-                });
+            // build-info.json 里的 ISO 时间（UTC+00:00）转北京时间 (UTC+8) 显示
+            function beijingTime(iso) {
+                var d = new Date(iso);
+                if (isNaN(d.getTime())) { return '未知'; }
+                var b = new Date(d.getTime() + 8 * 3600 * 1000);
+                function p(n) { return (n < 10 ? '0' : '') + n; }
+                return b.getUTCFullYear() + '-' + p(b.getUTCMonth() + 1) + '-' + p(b.getUTCDate()) +
+                    ' ' + p(b.getUTCHours()) + ':' + p(b.getUTCMinutes()) + ':' + p(b.getUTCSeconds());
             }
 
-            // 读取浏览器 CacheStorage 里实际缓存的文件及大小
-            function listCached() {
-                if (!('caches' in window)) { return Promise.resolve([]); }
-                return caches.keys().then(function (names) {
-                    return Promise.all(names.map(function (name) {
-                        return caches.open(name).then(function (cache) {
-                            return cache.keys().then(function (reqs) {
-                                return Promise.all(reqs.map(function (req) {
-                                    var p = new URL(req.url).pathname;
-                                    if (p.indexOf('/__meta/') === 0) { return null; } // 跳过内部 meta
-                                    return cache.match(req).then(function (res) {
-                                        var size = null;
-                                        if (res) {
-                                            var cl = res.headers.get('Content-Length');
-                                            if (cl && !isNaN(+cl)) { size = +cl; }
-                                        }
-                                        return { path: p, size: size };
-                                    });
-                                }));
-                            });
-                        });
-                    })).then(function (arrs) {
-                        var seen = {}, out = [];
-                        arrs.forEach(function (a) {
-                            (a || []).forEach(function (x) {
-                                if (!x || seen[x.path]) { return; }
-                                seen[x.path] = true;
-                                out.push(x);
-                            });
-                        });
-                        return out;
+            function row(title, value) {
+                return '<div style="font-weight:700;margin:12px 0 2px">' + esc(title) + '</div>' +
+                    '<div>' + esc(value) + '</div>';
+            }
+
+            function render(box) {
+                box.innerHTML = row('引擎版本', engineVersion || '加载中…');
+                fetch('/build-info.json', { cache: 'no-store' })
+                    .then(function (r) {
+                        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+                        return r.json();
+                    })
+                    .catch(function () { return null; })
+                    .then(function (info) {
+                        box.innerHTML = row('引擎版本', engineVersion || '加载中…') +
+                            row('最后更新时间', info && info.updatedAt ? beijingTime(info.updatedAt) : '未知');
                     });
-                }).catch(function () { return []; });
             }
 
-            function listRow(path, size, extra) {
-                return '<div style="padding:1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
-                    '<span style="color:#333">' + esc(path) + '</span>' +
-                    '<span style="float:right;color:#888;margin-left:8px">' + fmtSize(size) +
-                    (extra ? ' ' + esc(extra) : '') + '</span></div>';
-            }
-
-            function groupBlock(title, items) {
-                if (!items.length) { return ''; }
-                var h = '<div style="font-weight:700;margin:12px 0 2px">' + esc(title) + '</div>';
-                return h + items.map(function (it) { return listRow(it[0], it[1], it[2]); }).join('');
-            }
-
-            function render(container) {
-                Promise.all([
-                    fetchJSON(DATA_URL).catch(function () {
-                        // 旧版本没有 build-info.json：退回 version.json，仅能列出文件清单
-                        return fetchJSON(FALLBACK_URL).catch(function () { return null; })
-                            .then(function (m) {
-                                if (!m) { return null; }
-                                var files = {};
-                                Object.keys(m).forEach(function (k) { files[k] = null; });
-                                return { engineVersion: '未知', updatedAt: '未知', files: files };
-                            });
-                    }),
-                    listCached()
-                ]).then(function (r) {
-                    var info = r[0], cached = r[1] || [];
-                    var cachedMap = {};
-                    cached.forEach(function (c) { cachedMap[c.path] = c.size; });
-
-                    var html = '';
-                    html += '<div style="font-weight:700;margin:12px 0 2px">引擎版本</div>' +
-                        '<div>' + esc(info && info.engineVersion ? info.engineVersion : '未知') + '</div>';
-                    html += '<div style="font-weight:700;margin:12px 0 2px">最近更新时间</div>' +
-                        '<div>' + esc(info && info.updatedAt ? info.updatedAt : '未知') + '</div>';
-
-                    // 更新文件及大小（本次构建），按 引擎/界面 分组，并标注未缓存
-                    var engineFiles = [], uiFiles = [];
-                    if (info && info.files) {
-                        Object.keys(info.files).sort().forEach(function (p) {
-                            var inCache = (p in cachedMap);
-                            var row = [p, info.files[p], inCache ? '' : '（未缓存）'];
-                            (p.indexOf('/wasm/') === 0 ? engineFiles : uiFiles).push(row);
-                        });
-                    }
-                    var updatedHtml = groupBlock('引擎文件', engineFiles) + groupBlock('界面资源', uiFiles);
-                    html += '<div style="font-weight:700;margin:12px 0 2px">更新文件（本次构建）</div>' +
-                        (updatedHtml || '<div>无数据</div>');
-
-                    // 缓存文件及大小（浏览器实际缓存）
-                    var cachedRows = cached.slice().sort(function (a, b) { return a.path < b.path ? -1 : 1; })
-                        .map(function (c) { return [c.path, c.size, '']; });
-                    var cachedHtml = groupBlock('引擎文件', cachedRows.filter(function (r) { return r[0].indexOf('/wasm/') === 0; })) +
-                        groupBlock('界面资源', cachedRows.filter(function (r) { return r[0].indexOf('/wasm/') !== 0; }));
-                    html += '<div style="font-weight:700;margin:12px 0 2px">缓存文件（浏览器缓存）</div>' +
-                        (cachedHtml || '<div>（空）</div>');
-
-                    container.innerHTML = html;
-                }).catch(function () {
-                    container.innerHTML = '<div>无法读取版本信息</div>';
-                });
+            function rerenderAll() {
+                boxes.forEach(function (b) { render(b); });
             }
 
             function tryInject() {
@@ -269,14 +205,14 @@
                 if (!about) { return false; }
                 var content = about.querySelector('.content');
                 if (!content) { return false; }
-                if (injected.get(content)) { return true; }
-                injected.set(content, true);
+                if (content.getAttribute('data-xiangqi-about-info')) { return true; }
+                content.setAttribute('data-xiangqi-about-info', '1');
                 var box = document.createElement('div');
-                box.setAttribute('data-xiangqi-about-info', '1');
                 box.style.cssText = 'border-top:1px dashed #c5bdbd;margin-top:14px;padding:4px 20px 14px;' +
                     'font-size:0.8rem;color:#333;line-height:1.7;text-align:left;overflow:hidden';
                 box.innerHTML = '<div>加载中…</div>';
                 content.appendChild(box);
+                boxes.push(box);
                 render(box);
                 return true;
             }
