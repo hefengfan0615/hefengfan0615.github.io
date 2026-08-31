@@ -149,20 +149,42 @@ async function cacheFirstSWR(req, url, cache) {
 }
 
 // ----------------------------------------------------------------------------
-// 引擎文件：Cache First + 流式下载 + 续传。
-//   命中缓存 → 立即返回，后台按需校验（小文件 sha256 / data 用 meta）。
-//   未命中   → 加入/创建"飞行下载"，把已缓冲字节 + 实时字节流式返回给页面，
-//              进度可见；后台下载在页面刷新后仍继续并写回 CacheStorage。
+// 引擎文件：网络优先校验 + Cache First + 流式下载 + 续传。
+//   命中缓存 → 先拿最新 version.json 比对 hash（version.json 极小且网络优先）：
+//      一致 → 立即返回缓存（秒开，绝不重下大文件）；
+//      变了 → 删除旧缓存并回源下载（本次就用新引擎文件；data 走 meta 比对，
+//             不用读 50MB 字节）。这样 wasm 更新而 data 未变时，只快速替换
+//             引擎相关文件，data 继续沿用缓存。
+//   校验失败/清单缺失（离线）→ 回退旧缓存，保证离线可玩。
+//   未命中 / 需要更新 → 加入/创建"飞行下载"，把已缓冲字节 + 实时字节流式
+//              返回给页面，进度可见；后台下载在页面刷新后仍继续并写回缓存。
 // ----------------------------------------------------------------------------
 async function cacheFirstEngine(event, req, url, cache) {
     const cached = await cache.match(req);
+
     if (cached) {
-        // 后台按需重新校验，不阻塞本次响应
-        kickoffRevalidate(url, cache).catch(function () {});
-        return withIsolationHeaders(cached);
+        try {
+            const manifest = await getManifest(cache); // 最新清单（网络优先）
+            const expected = manifest ? manifest[url.pathname] : undefined;
+            if (expected) {
+                if (url.pathname === DATA_PATH) {
+                    const stored = await readStoredSha(cache); // data 用 meta 秒级比对
+                    if (stored === expected) return withIsolationHeaders(cached); // 已最新
+                } else {
+                    const hash = await sha256Hex(await readAllBytes(cached.clone().body));
+                    if (hash === expected) return withIsolationHeaders(cached); // 已最新
+                }
+                // 缓存内容落后于清单：删掉旧文件，走下方回源下载新版。
+                await cache.delete(req).catch(function () {});
+            } else {
+                return withIsolationHeaders(cached); // 拿不到清单：用缓存兜底
+            }
+        } catch (e) {
+            return withIsolationHeaders(cached); // 校验出错（如离线）：回退缓存
+        }
     }
 
-    // 无缓存：若正在下载则续传，否则启动新的飞行下载。
+    // 无缓存 / 需要更新：若正在下载则续传，否则启动新的飞行下载。
     let live = inflight.get(url.pathname);
     if (live && live.failed) {
         live = null; // 上次下载失败：重新开始
@@ -174,42 +196,6 @@ async function cacheFirstEngine(event, req, url, cache) {
         if (event) { try { event.waitUntil(live.promise); } catch (e) { /* 忽略 */ } }
     }
     return live.respond(); // 流式：已下载字节立刻给到 + 后续实时续传
-}
-
-// ----------------------------------------------------------------------------
-// 后台按需校验（引擎文件）：小文件比对 sha256，data 比对 meta 哈希。
-// ----------------------------------------------------------------------------
-async function kickoffRevalidate(url, cache) {
-    if (url.pathname === DATA_PATH) {
-        const manifest = await getManifest(cache);
-        const expected = manifest ? manifest[DATA_PATH] : undefined;
-        if (!expected) return;
-        const stored = await readStoredSha(cache);
-        if (stored === expected) return; // 已最新
-        const fresh = await fetch(DATA_PATH, { cache: "reload" });
-        if (fresh && fresh.ok && fresh.type === "basic") {
-            const bytes = await readAllBytes(fresh.clone().body);
-            const sha = await sha256Hex(bytes);
-            await cache.put(DATA_PATH, fresh.clone()).catch(function () {});
-            await cache.put(DATA_META_KEY, new Response(sha, { headers: { "Content-Type": "text/plain" } }))
-                .catch(function () {});
-            notifyUpdate();
-        }
-        return;
-    }
-
-    const manifest = await getManifest(cache);
-    const expected = manifest ? manifest[url.pathname] : undefined;
-    if (!expected) return;
-    const cached = await cache.match(url.href);
-    if (!cached) return;
-    const hash = await sha256Hex(await readAllBytes(cached.clone().body));
-    if (hash === expected) return; // 已最新
-    const fresh = await fetch(url.href, { cache: "reload" });
-    if (fresh && fresh.ok && fresh.type === "basic") {
-        await cache.put(url.href, fresh.clone()).catch(function () {});
-        notifyUpdate();
-    }
 }
 
 // ============================================================================
