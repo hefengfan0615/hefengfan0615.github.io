@@ -127,10 +127,19 @@ jobs:
                   ["git", "describe", "--tags", "--always"],
                   cwd=root, stderr=subprocess.DEVNULL
               ).decode().strip()
+              # "最后更新时间"只反映引擎自身的更新时间：取引擎相关文件
+              # （wasm 产物 + src 引擎源码）最后一次变更的提交时间。
+              # 纯前端改动（HTML/sw.js/assets 等）不再让该时间虚变。
               updated_at = subprocess.check_output(
-                  ["git", "log", "-1", "--format=%cI", "HEAD"],
+                  ["git", "log", "-1", "--format=%cI", "HEAD", "--",
+                   "wasm/pikafish.js", "wasm/pikafish.wasm", "wasm/pikafish.data", "src/"],
                   cwd=root, stderr=subprocess.DEVNULL
               ).decode().strip()
+              if not updated_at:  # 引擎文件从未有提交记录时的兜底
+                  updated_at = subprocess.check_output(
+                      ["git", "log", "-1", "--format=%cI", "HEAD"],
+                      cwd=root, stderr=subprocess.DEVNULL
+                  ).decode().strip()
           except Exception:
               version = "dev"
               updated_at = "unknown"
