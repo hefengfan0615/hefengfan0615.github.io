@@ -113,6 +113,41 @@ jobs:
           PY
           ls -lh ../version.json
 
+      - name: Generate build-info.json (engine version / updated time / file sizes)
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from datetime import datetime, timezone
+
+          root = ".."
+          try:
+              version = subprocess.check_output(
+                  ["git", "describe", "--tags", "--always", "--dirty=-dirty"],
+                  cwd=root, stderr=subprocess.DEVNULL
+              ).decode().strip()
+          except Exception:
+              version = "dev"
+
+          with open(os.path.join(root, "version.json"), "r") as fh:
+              manifest = json.load(fh)
+
+          info = {
+              "engineVersion": version,
+              "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+              "files": {},
+          }
+          for path in manifest:
+              fp = os.path.join(root, path.lstrip("/"))
+              if os.path.exists(fp):
+                  info["files"][path] = os.path.getsize(fp)
+
+          with open(os.path.join(root, "build-info.json"), "w") as fh:
+              json.dump(info, fh, indent=2, sort_keys=True)
+          print(json.dumps(info, indent=2, sort_keys=True))
+          PY
+          ls -lh ../build-info.json
+
       # Step 2: test exactly like the web page loads the engine
       # (Pikafish().then(...); engine.send_command(...)):
       #   - uci / isready handshake (NNUE data file is loaded from pikafish.data)
@@ -132,6 +167,6 @@ jobs:
           git config user.name "Pikafish Bot"
           git config user.email "pikafish-bot@github.com"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git add -f wasm/ version.json sw.js
+          git add -f wasm/ version.json build-info.json sw.js
           git commit -m "Update WASM build + content manifest (multithreaded, NNUE data file) [skip ci]" || echo "No changes to commit"
           git push

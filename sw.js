@@ -21,6 +21,7 @@
 
 const CACHE_NAME = "fengfan-xiangqi-files-v1";
 const MANIFEST_PATH = "/version.json";
+const BUILD_INFO_PATH = "/build-info.json"; // 构建信息：引擎版本 / 更新时间 / 各文件大小
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
 
@@ -98,6 +99,9 @@ async function serve(event, req, url) {
 
     // version.json 自身：必须拿到最新清单。
     if (url.pathname === MANIFEST_PATH) return networkFirst(req, cache);
+
+    // build-info.json（关于界面展示用）：网络优先保证新鲜，离线回退缓存。
+    if (url.pathname === BUILD_INFO_PATH) return networkFirst(req, cache);
 
     // 导航请求（HTML 文档）：网络优先，保证界面每次都是最新，并第一时间注入
     // COOP/COEP 建立跨源隔离（无痕模式卡 0% 的修复就靠这条快速通道）。
