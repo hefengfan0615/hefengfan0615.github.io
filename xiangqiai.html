@@ -228,6 +228,54 @@
             onMaybeOpen(); // 页面加载时若 About 已打开则立即尝试
         })();
     </script>
+    <script>
+        // 主动检查 Service Worker 本体（sw.js）是否有更新：检测到新版就自动接管并刷新一次。
+        // 目的：让"引擎缓存同步校验"等最新 SW 逻辑尽快在用户浏览器里生效，
+        // 否则浏览器默认最长 24 小时才检查一次 sw.js，导致改了引擎刷新却还用旧缓存。
+        // 放在 HTML 里：HTML 走网络优先，每次都是最新版，能绕开"旧 SW 服务旧页面"的困境。
+        (function () {
+            if (!('serviceWorker' in navigator)) { return; }
+            var KEY = 'xiangqi-sw-autoreload';
+            var MAX = 2; // 每会话最多自动刷新 2 次，防止新旧交替时死循环
+            var reloaded = false;
+
+            function doReload() {
+                if (reloaded) { return; }
+                reloaded = true;
+                window.location.reload();
+            }
+
+            function adoptNew(reg, n) {
+                if (!reg.waiting || !navigator.serviceWorker.controller) { return; }
+                sessionStorage.setItem(KEY, String(n + 1));
+                reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+                navigator.serviceWorker.addEventListener('controllerchange', doReload);
+                setTimeout(doReload, 4000); // 兜底：controllerchange 未触发也能刷新
+            }
+
+            navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function (reg) {
+                var n = parseInt(sessionStorage.getItem(KEY) || '0', 10);
+                if (n >= MAX) { return; }
+
+                if (reg.waiting && navigator.serviceWorker.controller) {
+                    adoptNew(reg, n); // 已有新版在等待接管
+                    return;
+                }
+                reg.addEventListener('updatefound', function () {
+                    var w = reg.installing;
+                    if (!w) { return; }
+                    w.addEventListener('statechange', function () {
+                        // 新版安装完成且页面已被旧 SW 控制 → 自动切换并刷新
+                        if (w.state === 'installed' && navigator.serviceWorker.controller) {
+                            adoptNew(reg, n);
+                        }
+                    });
+                });
+                // 强制绕过 HTTP 缓存检查 sw.js 更新
+                if (typeof reg.update === 'function') { reg.update().catch(function () {}); }
+            }).catch(function () {});
+        })();
+    </script>
 </body>
 
 </html>
