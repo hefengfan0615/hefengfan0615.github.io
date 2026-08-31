@@ -24,7 +24,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # 引擎源码（src/）没变就不重建 WASM。wasm 构建是非确定性的（emcc 写入
+      # 时间戳），每次重建 hash 都会变；若纯前端提交也重建，会导致用户反复
+      # 重下引擎、"最后更新时间"虚变、CDN 反复波动。只有本次推送确实改了
+      # src/ 才重新构建引擎，否则沿用仓库里已有的 wasm 产物。
+      - name: Check if engine source changed
+        id: src
+        working-directory: ./
+        run: |
+          before="${{ github.event.before }}"
+          if [ -n "$before" ] \
+             && [ "$before" != "0000000000000000000000000000000000000000" ] \
+             && git rev-parse "$before" >/dev/null 2>&1 \
+             && git diff --quiet "$before" HEAD -- src/; then
+            echo "changed=false"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Emscripten
+        if: steps.src.outputs.changed == 'true'
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git $EMSDK_PATH
           cd $EMSDK_PATH
@@ -37,6 +58,7 @@ jobs:
           emcc --version
 
       - name: Download NNUE network
+        if: steps.src.outputs.changed == 'true'
         run: |
           source $EMSDK_PATH/emsdk_env.sh
           curl -skL "${{ env.NNUE_URL }}" -o pikafish.nnue
@@ -52,6 +74,7 @@ jobs:
       #   -flto, -s USE_PTHREADS=1, -s PROXY_TO_PTHREAD=1 and a
       #   PTHREAD_POOL_SIZE scaled to navigator.hardwareConcurrency.
       - name: Build WASM and package NNUE into data file (pikafish.data)
+        if: steps.src.outputs.changed == 'true'
         run: |
           source $EMSDK_PATH/emsdk_env.sh
           make -j$(nproc) build \
@@ -71,6 +94,7 @@ jobs:
           fi
 
       - name: Deploy wasm folder (js/wasm/data/worker + web page assets)
+        if: steps.src.outputs.changed == 'true'
         run: |
           mkdir -p ../wasm
           cp -f pikafish.js        ../wasm/
