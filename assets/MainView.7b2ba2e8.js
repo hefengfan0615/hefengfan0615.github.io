@@ -31760,7 +31760,6 @@ const gy = "XIANGQIAI_COM_"
             showConfirmEditDialog: !1,
             chessdbResult: {},
             chessDbRecords: {},
-            chessDbFenQueryTime: {},
             debug: !1,
             engineChessdbActive: 0,
             windowWidth: window.innerWidth,
@@ -32867,7 +32866,8 @@ const gy = "XIANGQIAI_COM_"
                 } else
                     Q1.queryFen(this.game.getFen(), this.uiSettings.language).then(e=>{
                         this.chessDbRecords[t] = e,
-                        this.onChessDbResultChange(e)
+                        this.onChessDbResultChange(e),
+                        this.tryChessDbOverride(t, e)
                     }
                     ).catch(e=>{}
                     )
@@ -32906,48 +32906,51 @@ const gy = "XIANGQIAI_COM_"
                 this.refreshAnalyze());
             this.doEngineAction()
         },
+        useChessDbMove(t) {
+            let r = this.chessDbRecords[t];
+            if (!r || r.msg !== "" || !Array.isArray(r.moveList) || r.moveList.length === 0) return !1;
+            let n = r.moveList[0].score;
+            if (typeof n !== "number") return !1;
+            (this.flipBoard ? "b" : "w") !== r.side && (n = -n);
+            n > 2e4 ? n = {
+                mate: 3e4 - n
+            } : n < -2e4 ? n = {
+                mate: -3e4 - n
+            } : n = {
+                cp: n
+            };
+            let a = r.moveList[0];
+            try {
+                return (this.game.getMoveList().length < this.thinkingSettings.chessdb.disable_ply || a.type === "egtb" && this.thinkingSettings.chessdb.always_use_egtb) && (this.thinkingDetail.unshift([{
+                    board_side: this.flipBoard ? "b" : "w",
+                    type: "chessdb",
+                    pv: a.move,
+                    pvChn: a.chn_move_name,
+                    score: n,
+                    side: r.side
+                }]),
+                this.makeMoveByString(a.move),
+                !0)
+            } catch (t) {
+                return console.log(t), !1
+            }
+        },
+        tryChessDbOverride(t, e) {
+            // 引擎已为本局面开始思考后才收到云库招法：改用云库招法并停掉引擎搜索。
+            if (!this.thinkingSettings.chessdb.auto_move) return;
+            if (!e || e.msg !== "" || !Array.isArray(e.moveList) || e.moveList.length === 0) return;
+            if (!(this.enginePlayRed && this.game.turn === "w" || this.enginePlayBlack && this.game.turn === "b")) return;
+            if (this.game.getFen() !== t || !this.engine || !this.engine.Analyzing || this.isEndOfAnalysis) return;
+            if (this.useChessDbMove(t))
+                this.engine.stop()
+        },
         doEngineAction() {
             if (this.enginePlayRed && this.game.turn === "w" || this.enginePlayBlack && this.game.turn === "b") {
                 let t = this.game.getFen();
                 if (this.thinkingSettings.chessdb.auto_move) {
-                    let e = !1;
-                    if (!(t in this.chessDbRecords))
-                        // 在线最多等待 2s 云库结果；无网时立即放行引擎出招。
-                        if (!navigator.onLine || (t in this.chessDbFenQueryTime || (this.chessDbFenQueryTime[t] = new Date().getTime()), new Date().getTime() - this.chessDbFenQueryTime[t] > 2000))
-                            e = !0;
-                        else
-                            return;
-                    let r = this.chessDbRecords[t]
-                      , i = !1;
-                    if (!e && r && r.msg === "" && Array.isArray(r.moveList) && r.moveList.length > 0) {
-                        let n = r.moveList[0].score;
-                        if (typeof n === "number") {
-                            (this.flipBoard ? "b" : "w") !== r.side && (n = -n),
-                            n > 2e4 ? n = {
-                                mate: 3e4 - n
-                            } : n < -2e4 ? n = {
-                                mate: -3e4 - n
-                            } : n = {
-                                cp: n
-                            };
-                            let a = r.moveList[0];
-                            try {
-                                (this.game.getMoveList().length < this.thinkingSettings.chessdb.disable_ply || a.type === "egtb" && this.thinkingSettings.chessdb.always_use_egtb) && (this.thinkingDetail.unshift([{
-                                    board_side: this.flipBoard ? "b" : "w",
-                                    type: "chessdb",
-                                    pv: a.move,
-                                    pvChn: a.chn_move_name,
-                                    score: n,
-                                    side: r.side
-                                }]),
-                                this.makeMoveByString(a.move),
-                                i = !0)
-                            } catch (t) {
-                                console.log(t)
-                            }
-                        }
-                    }
-                    i || (this.engine.setFen(this.game.getFenWithMove()),
+                    // 云库有有效招法就用云库走棋；没有（或查询未返回）就立即启动引擎出招，
+                    // 不再空等云库那 2s。云库结果稍后才到时由 tryChessDbOverride 覆盖引擎出招。
+                    this.useChessDbMove(t) || (this.engine.setFen(this.game.getFenWithMove()),
                     this.multiPvInfoBuffer = {},
                     this.engine.go(this.thinkingSettings.movetime * 1e3, this.thinkingSettings.depth, -1, this.getSearchMoves()))
                 } else
