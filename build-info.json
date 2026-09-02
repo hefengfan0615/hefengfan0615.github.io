@@ -1,11 +1,11 @@
 {
-  "engineVersion": "90d990d",
+  "engineVersion": "6e13fd5",
   "files": {
     "/assets/ChessBoard.46291e70.js": 85785,
     "/assets/ChessBoard.9232dc69.css": 170,
     "/assets/EngineHelper.worker.881f7921.js": 999,
     "/assets/MainView.4ccb1b33.css": 4604,
-    "/assets/MainView.7b2ba2e8.js": 1059992,
+    "/assets/MainView.7b2ba2e8.js": 1060022,
     "/assets/howler.5cf60c4f.js": 70134,
     "/assets/index.65062099.css": 199510,
     "/assets/index.b58f0dd0.js": 507893,
@@ -15,8 +15,8 @@
     "/sw.js": 25854,
     "/wasm/pikafish.data": 51585654,
     "/wasm/pikafish.js": 84362,
-    "/wasm/pikafish.wasm": 721612,
+    "/wasm/pikafish.wasm": 721819,
     "/xiangqiai.html": 14229
   },
-  "updatedAt": "2026-09-01T22:24:39+08:00"
+  "updatedAt": "2026-09-03T06:47:53+08:00"
 }
