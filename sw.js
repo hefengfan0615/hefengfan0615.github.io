@@ -24,6 +24,11 @@ const MANIFEST_PATH = "/version.json";
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
 
+// 飞行下载自愈参数：防止"刷新/回源卡死"后 LiveDownload 被永久复用，进度一直 0%。
+const HEADER_TIMEOUT_MS = 20000; // 回源等响应头最长时间，超过视为回源卡死
+const STALL_TIMEOUT_MS = 30000;  // 读数据 30s 无字节推进视为下载卡死
+const WATCHDOG_MS = 5000;        // 看门狗扫描周期
+
 // 前端界面外壳：小体积，安装时预缓存，保证离线首屏
 const APP_SHELL = [
     "/xiangqiai.html",
@@ -42,6 +47,7 @@ function isEngineFile(urlPath) {
 // 安装：预缓存前端外壳并立即 skipWaiting，尽快接管页面。
 // ----------------------------------------------------------------------------
 self.addEventListener("install", function (event) {
+    ensureWatchdog(); // 提前跑看门狗，尽早发现卡死下载
     event.waitUntil(
         (async function () {
             const cache = await caches.open(CACHE_NAME);
@@ -57,6 +63,7 @@ self.addEventListener("install", function (event) {
 // 激活：清理旧结构缓存并立即接管页面。
 // ----------------------------------------------------------------------------
 self.addEventListener("activate", function (event) {
+    ensureWatchdog(); // 兜底再跑看门狗
     event.waitUntil(
         (async function () {
             const keys = await caches.keys();
@@ -183,17 +190,10 @@ async function cacheFirstEngine(event, req, url, cache) {
             }
         }
 
-        // 需要更新 / 无缓存：若正在下载则续传，否则启动新的飞行下载。
-        let live = inflight.get(url.pathname);
-        if (live && live.failed) {
-            live = null; // 上次下载失败：重新开始
-        }
-        if (!live) {
-            live = new LiveDownload(url);
-            inflight.set(url.pathname, live);
-            // 页面刷新/关闭后，SW 仍保持存活把下载写完。
-            if (event) { try { event.waitUntil(live.promise); } catch (e) { /* 忽略 */ } }
-        }
+        // 需要更新 / 无缓存：复用/续传在途下载；已失败或卡死则自动换新。
+        // ensureLive 内部会自愈卡死的下载（含正在等头的请求迁到新下载），
+        // 保证之后刷新/点重新加载不再是"进度一直 0%"。
+        const live = ensureLive(url, event);
         return live.respond(); // 流式：已下载字节立刻给到 + 后续实时续传
     }
 
@@ -253,11 +253,15 @@ class LiveDownload {
         this.statusText = "";
         this.done = false;
         this.failed = false;
+        this.abandoned = false;
+        this.reader = null;     // 网络源读取分支（供 abandon 时 cancel 中止）
+        this.createdAt = Date.now();
+        this.lastByteAt = this.createdAt;
         // 页面消费者（首/刷新统一）：push 模型，_start() 每收到一块就喂给它们。
         // 不使用 pull 返回 Promise 的续期方式 —— 实测浏览器/Node 在 Promise 兑现后
         // 不再重新调用 pull，会导致刷新续传的流死锁、进度一直为 0。
         this.replayConsumers = new Set();
-        this.headerWaiters = [];     // 等待响应头的 respond() 调用者
+        this.headerWaiters = [];     // 等待响应头的 respond() 调用者（resolve/reject 直存）
         this.promise = this._start(); // 后台下载 + 写缓存，完成后解析
     }
 
@@ -265,6 +269,7 @@ class LiveDownload {
         inflight.set(this.path, this);
         try {
             const resp = await fetch(this.url.href, { cache: "reload" });
+            if (this.abandoned) { /* 已在等待回源期间被看门狗废弃 */ }
             this.status = resp.status;
             this.statusText = resp.statusText;
             this.headers = resp.headers;
@@ -275,14 +280,16 @@ class LiveDownload {
 
             // SW 持有网络源的唯一读取分支，逐块缓冲并多播给所有页面消费者。
             // （不再 tee 出一路给页面，避免刷新/关闭后分支背压/取消导致卡死 0%。）
-            const reader = resp.body.getReader();
+            this.reader = resp.body.getReader();
             for (;;) {
-                const r = await reader.read();
+                const r = await this.reader.read();
                 if (r.done) break;
+                this.lastByteAt = Date.now();
                 this.chunks.push(r.value);
                 this.received += r.value.byteLength;
                 this._pumpReplays();
             }
+            if (this.abandoned) return; // 被废弃：不再提交缓存
             this.done = true;
             this._pumpReplays();
             await this._commit();
@@ -292,13 +299,71 @@ class LiveDownload {
             this._pumpReplays();
             this._rejectHeaderWaiters(e);
         } finally {
-            inflight.delete(this.path);
+            // 只有自己仍在 inflight 才清理，避免误删看门狗换上的新下载。
+            if (inflight.get(this.path) === this) inflight.delete(this.path);
         }
+    }
+
+    // 首次捕获到网络响应头，回应所有排队等头的 respond() 调用者。
+    _resolveHeaderWaiters() {
+        const arr = this.headerWaiters;
+        this.headerWaiters = [];
+        for (const w of arr) this._settleWaiter(w, this);
+    }
+
+    _rejectHeaderWaiters(e) {
+        const arr = this.headerWaiters;
+        this.headerWaiters = [];
+        for (const w of arr) {
+            try { w.reject(e); } catch (err) { /* 忽略 */ }
+        }
+    }
+
+    // 把一个排队等头的 waiter 用某个下载实例构造出流式响应交付。
+    _settleWaiter(w, target) {
+        let resp = null;
+        try { resp = target._buildOutgoing(); }
+        catch (e) { try { w.reject(e); return; } catch (_) { return; } }
+        try { w.resolve(resp); } catch (e) { /* 忽略 */ }
+    }
+
+    // 是否已确定卡死：等待响应头过久 / 读数据长时间无推进。
+    isStalled() {
+        if (this.done || this.abandoned) return false;
+        const now = Date.now();
+        if (!this.headers) return (now - this.createdAt) > HEADER_TIMEOUT_MS;
+        return (now - this.lastByteAt) > STALL_TIMEOUT_MS;
+    }
+
+    // 废弃本项目：取消网络读取、标记失败；把仍在等头的请求迁到全新下载上，
+    // 保证"点我重新加载 / 刷新"不会复用这个卡死的下载而一直 0%。
+    //   有等头请求时，就地换上一个全新下载并把它注册到 inflight（避免外面再建
+    //   一次导致重复下载 50MB），同时把这些 waiter 交给新下载续传。
+    abandon() {
+        if (this.abandoned || this.done) return;
+        this.abandoned = true;
+        this.failed = true;
+        if (this.reader) { try { this.reader.cancel().catch(function () {}); } catch (e) { /* 忽略 */ } }
+        // 若已有页面正排队等头，绝不能让他们悬挂：立即换新下载并接管 waiters。
+        if (this.headerWaiters.length) {
+            const replacement = new LiveDownload(this.url);
+            inflight.set(this.path, replacement); // 接管在途位，避免外面新建重复下载
+            this.adoptWaitersFrom(replacement);
+        }
+    }
+
+    // 把调用者的等头 waiter 转交给 target（target 构造响应交付，绝不悬挂）。
+    adoptWaitersFrom(target) {
+        const waiters = this.headerWaiters;
+        this.headerWaiters = [];
+        for (const w of waiters) target._settleWaiter(w, target);
+        target._pumpReplays();
     }
 
     // push 模型：把新到/已缓冲的字节喂给所有续传消费者。
     _pumpReplays() {
-        for (const c of this.replayConsumers) this._feedReplay(c);
+        if (this.abandoned) return;
+        for (const c of Array.from(this.replayConsumers)) this._feedReplay(c);
     }
 
     // 喂给单个续传消费者：回放已缓冲块；下载结束后 close/error。
@@ -323,18 +388,6 @@ class LiveDownload {
             consumer.active = false;
             this.replayConsumers.delete(consumer);
         }
-    }
-
-    _resolveHeaderWaiters() {
-        const arr = this.headerWaiters;
-        this.headerWaiters = [];
-        for (const w of arr) w.resolve();
-    }
-
-    _rejectHeaderWaiters(e) {
-        const arr = this.headerWaiters;
-        this.headerWaiters = [];
-        for (const w of arr) w.reject(e);
     }
 
     async _commit() {
@@ -366,22 +419,26 @@ class LiveDownload {
     //   headerWaiters 永久阻塞而进度一直为 0）；失败时 reject 走重试/离线。
     respond() {
         const self = this;
-        // 网络响应头还没到（下载尚未开始回源）：先排队，头就绪后再给响应，
-        // 保证状态码 / Content-Type 等头信息正确（fetch 失败则 reject）。
-        if (!this.headers && !this.done) {
+        // 网络响应头还没到：先排队，等头就绪后回放。抓不到头（回源卡死）时由
+        // 看门狗 abandon() 迁到新下载 / 终止，绝不让本调用永久悬挂（刷新卡 0% 根因）。
+        if (!this.headers && !this.done && !this.abandoned) {
             return new Promise(function (resolve, reject) {
-                self.headerWaiters.push({
-                    resolve: function () { resolve(self.respond()); },
-                    reject: reject
-                });
+                self.headerWaiters.push({ resolve: resolve, reject: reject });
             });
         }
-        // 已完成但下载失败且一个字节都没收到：明确报错，让引擎 fetch 失败走重试/离线。
-        if (this.done && this.failed && this.received === 0) {
-            return Promise.reject(new Error("engine download failed"));
+        try {
+            return Promise.resolve(this._buildOutgoing());
+        } catch (e) {
+            return Promise.reject(e);
         }
-        // 首/刷新各页面统一走多播流：回放已缓冲字节 + 实时字节，进度即刻可见。
-        return Promise.resolve(this._buildReplayResponse());
+    }
+
+    // 统一出口：完成但失败且零字节时抛错；否则总是给"多播续传流"。
+    _buildOutgoing() {
+        if (this.done && this.failed && this.received === 0) {
+            throw new Error("engine download failed");
+        }
+        return this._buildReplayResponse();
     }
 
     // 多播续传响应（所有页面消费者统一走这里）：回放已缓冲字节 + 实时字节。
@@ -413,6 +470,41 @@ class LiveDownload {
             headers: headers
         });
     }
+}
+
+// 启动（或在途则复用）一个下载；若在途的已失败/卡死，则替换为全新下载。
+// 返回可用的 in-flight 实例，由调用方统一走 live.respond() 交给页面。
+function ensureLive(url, event) {
+    const path = url.pathname;
+    let live = inflight.get(path);
+    if (live && !live.failed && live.isStalled()) {
+        // 卡死：abandon 可能已就地换新并注册到 inflight（有等头请求时），
+        // 也可能只标记失败。两种都重新读一次当前在途位再决定。
+        live.abandon();
+        live = inflight.get(path);
+        if (live === undefined || live.failed) live = null;
+    }
+    if (!live || live.failed) {
+        live = new LiveDownload(url);
+        inflight.set(path, live);
+        if (event) { try { event.waitUntil(live.promise); } catch (e) { /* 忽略 */ } }
+    }
+    return live;
+}
+
+// ----------------------------------------------------------------------------
+// 看门狗：周期性扫描在途下载，废弃"卡死"的实例（等头过久 / 读数据长时间无推进）。
+//   一旦废弃，正在等头的请求会被迁到全新下载上继续，进度恢复正常，刷新不再 0%。
+// ----------------------------------------------------------------------------
+let watchdogTimer = null;
+function ensureWatchdog() {
+    if (watchdogTimer) return;
+    watchdogTimer = setInterval(function () {
+        for (const live of Array.from(inflight.values())) {
+            if (live.done || live.abandoned) continue;
+            if (live.isStalled()) live.abandon();
+        }
+    }, WATCHDOG_MS);
 }
 
 // ----------------------------------------------------------------------------
