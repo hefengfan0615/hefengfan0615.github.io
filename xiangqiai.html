@@ -69,7 +69,7 @@
             var COUNT = 'xiangqi-co-count';     // 注入式自动刷新的次数（用于兜住恶性循环）
             var LAST = 'xiangqi-co-last';       // 上一次自动刷新的时间戳（简单限流）
             var MIN_MS = 1500;                  // 自动刷新的最小间隔
-            var MAX_AUTO = 3;                   // 自动刷新次数上限，防止隔离迟迟不来时无限刷新
+            var MAX_AUTO = 6;                   // 自动刷新次数上限，防止隔离迟迟不来时无限刷新
 
             function isIsolated() { return window.crossOriginIsolated === true; }
             function clearKeys() {
@@ -87,6 +87,13 @@
             sessionStorage.removeItem(AUTO); // 消费该标记
             // 手动/全新导航与自动刷新无关：计数清零
             if (!fromAuto) n = 0;
+            // 关键修复（无痕模式卡 0%）：本次页面加载时 SW 尚未接管（controller 为空），
+            // 说明上一步那个"自动刷新"根本没经过 SW，COOP/COEP 注入不到文档，属于无效
+            // 尝试。连点原生刷新时这类无效导航会把自动刷新预算白白耗尽，等 SW 真正接管
+            // 后预算已用完 → 引导就此停手，页面停在未隔离、引擎进度一直 0%。因此凡是
+            // 非 SW 接管的无效加载一律不计入预算，保证后续一经 SW 接管的有效刷新仍会继续
+            // 执行到隔离完成；而"引擎已在后台续传、一隔离即以已下载进度继续"由 sw.js 保证。
+            if (!navigator.serviceWorker.controller) n = 0;
 
             var reloading = false;
             function doReload() {
