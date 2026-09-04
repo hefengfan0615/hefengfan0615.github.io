@@ -1,18 +1,70 @@
 {
-  "/assets/ChessBoard.46291e70.js": "f832ef8254f774a7af3214842f28ba1755cc358cf2c4bd72050aeab33f75ef34",
-  "/assets/ChessBoard.9232dc69.css": "2ac2040df9a92c6e890c3000ecd3cf38f4c8d7694e51c167ce939f84ad40bad4",
-  "/assets/EngineHelper.worker.881f7921.js": "78bc571d96478363a8763dbed109f6b0cc7f133d27813ea816a1ecdaca7cac05",
-  "/assets/MainView.4ccb1b33.css": "ebab801a38cfef496f9526598ff3b8b67b59d11a113e1bfdcbe9b1df360a2931",
-  "/assets/MainView.7b2ba2e8.js": "e643d435bb579544aba508dd06604f3b38f3886eb65879ef04b47a802c067762",
-  "/assets/howler.5cf60c4f.js": "71ab5e2ef7462d2e7045f9de2effa8cc33323eb58da120a2d3e84165b8de8b09",
-  "/assets/index.65062099.css": "e89ee185ba5c76b9cfe4166c3490076ec720e3deee0e8c5afac85a5aa584f938",
-  "/assets/index.b58f0dd0.js": "c6014d6555bb08e9b0ae17b6f397cc1ec591469cac2dc51e52129702cc15e020",
-  "/assets/vschess.function.e5de4338.js": "ab64242006bd2a4b9180d56c1ac82069f69bb814e51b0c9315f051e3d5e03e37",
-  "/assets/workbox-window.js": "214f4f7a483c9e22dc749fe43ef06d9bc745fb27ecac3c089f99771dd033bad9",
-  "/assets/xqf.2e5d5959.js": "45b0480e7fe06dbe654e055d843a20d97dce22ee603d43ff74fc582d0fc92d92",
-  "/sw.js": "86b0475415731e53a6d7920159ccedb5c03dcdddcb3a4c058c2e7562cbef1f68",
-  "/wasm/pikafish.data": "3cd15292bf8c979884262f57fc723959fc0dea43b4d8d544f88db5ceb2479e24",
-  "/wasm/pikafish.js": "1e62dbe7f9be95fc6b2d4f6bea672bba34cc7f020eaccc0c311e8b01478e4ade",
-  "/wasm/pikafish.wasm": "3c00484df54219a3b19d962cb7541d58935105a52a1c77ad2494dce685c6ef9b",
-  "/xiangqiai.html": "61efc1d9fdd3e5083059b7a48db52c4fc82aa9febeed6e64dd4c29033fa562e0"
+  "engineVersion": "22db3e9",
+  "files": {
+    "/assets/ChessBoard.46291e70.js": {
+      "sha256": "f832ef8254f774a7af3214842f28ba1755cc358cf2c4bd72050aeab33f75ef34",
+      "size": 85785
+    },
+    "/assets/ChessBoard.9232dc69.css": {
+      "sha256": "2ac2040df9a92c6e890c3000ecd3cf38f4c8d7694e51c167ce939f84ad40bad4",
+      "size": 170
+    },
+    "/assets/EngineHelper.worker.881f7921.js": {
+      "sha256": "78bc571d96478363a8763dbed109f6b0cc7f133d27813ea816a1ecdaca7cac05",
+      "size": 999
+    },
+    "/assets/MainView.4ccb1b33.css": {
+      "sha256": "ebab801a38cfef496f9526598ff3b8b67b59d11a113e1bfdcbe9b1df360a2931",
+      "size": 4604
+    },
+    "/assets/MainView.7b2ba2e8.js": {
+      "sha256": "e643d435bb579544aba508dd06604f3b38f3886eb65879ef04b47a802c067762",
+      "size": 1060022
+    },
+    "/assets/howler.5cf60c4f.js": {
+      "sha256": "71ab5e2ef7462d2e7045f9de2effa8cc33323eb58da120a2d3e84165b8de8b09",
+      "size": 70134
+    },
+    "/assets/index.65062099.css": {
+      "sha256": "e89ee185ba5c76b9cfe4166c3490076ec720e3deee0e8c5afac85a5aa584f938",
+      "size": 199510
+    },
+    "/assets/index.b58f0dd0.js": {
+      "sha256": "c6014d6555bb08e9b0ae17b6f397cc1ec591469cac2dc51e52129702cc15e020",
+      "size": 507893
+    },
+    "/assets/vschess.function.e5de4338.js": {
+      "sha256": "ab64242006bd2a4b9180d56c1ac82069f69bb814e51b0c9315f051e3d5e03e37",
+      "size": 251538
+    },
+    "/assets/workbox-window.js": {
+      "sha256": "214f4f7a483c9e22dc749fe43ef06d9bc745fb27ecac3c089f99771dd033bad9",
+      "size": 9202
+    },
+    "/assets/xqf.2e5d5959.js": {
+      "sha256": "45b0480e7fe06dbe654e055d843a20d97dce22ee603d43ff74fc582d0fc92d92",
+      "size": 87038
+    },
+    "/sw.js": {
+      "sha256": "3b035d0cf959b9f22d467a3ea812ef80ceb6ba0dc61a7c8e6c85ae1c12d05c6f",
+      "size": 26088
+    },
+    "/wasm/pikafish.data": {
+      "sha256": "3cd15292bf8c979884262f57fc723959fc0dea43b4d8d544f88db5ceb2479e24",
+      "size": 51585654
+    },
+    "/wasm/pikafish.js": {
+      "sha256": "1e62dbe7f9be95fc6b2d4f6bea672bba34cc7f020eaccc0c311e8b01478e4ade",
+      "size": 84362
+    },
+    "/wasm/pikafish.wasm": {
+      "sha256": "3c00484df54219a3b19d962cb7541d58935105a52a1c77ad2494dce685c6ef9b",
+      "size": 721900
+    },
+    "/xiangqiai.html": {
+      "sha256": "acc080572e5a1cab1a97f00caa95c1e8f0889706103ddd60481d24fe4efa66ba",
+      "size": 15008
+    }
+  },
+  "updatedAt": "2026-09-04T14:58:18+00:00"
 }

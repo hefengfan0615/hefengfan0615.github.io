@@ -21,7 +21,6 @@
 
 const CACHE_NAME = "fengfan-xiangqi-files-v1";
 const MANIFEST_PATH = "/version.json";
-const BUILD_INFO_PATH = "/build-info.json"; // 构建信息：引擎版本 / 更新时间 / 各文件大小
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
 
@@ -97,11 +96,8 @@ self.addEventListener("fetch", function (event) {
 async function serve(event, req, url) {
     const cache = await caches.open(CACHE_NAME);
 
-    // version.json 自身：必须拿到最新清单。
+    // version.json 自身：必须拿到最新清单（已内联引擎版本 / 更新时间 / 文件大小）。
     if (url.pathname === MANIFEST_PATH) return networkFirst(req, cache);
-
-    // build-info.json（关于界面展示用）：网络优先保证新鲜，离线回退缓存。
-    if (url.pathname === BUILD_INFO_PATH) return networkFirst(req, cache);
 
     // 导航请求（HTML 文档）：网络优先，保证界面每次都是最新，并第一时间注入
     // COOP/COEP 建立跨源隔离（无痕模式卡 0% 的修复就靠这条快速通道）。
@@ -124,7 +120,7 @@ async function cacheFirstSWR(req, url, cache) {
     const refreshing = (async function () {
         try {
             const manifest = await getManifest(cache);
-            const expected = manifest ? manifest[url.pathname] : undefined;
+            const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
             if (expected && cached) {
                 const hash = await sha256Hex(await readAllBytes(cached.clone().body));
                 if (hash === expected) return; // 缓存内容即最新，无需更新
@@ -164,7 +160,7 @@ async function cacheFirstEngine(event, req, url, cache) {
         if (cached) {
             try {
                 const manifest = await getManifest(cache); // 最新清单（缓存击穿）
-                const expected = manifest ? manifest[url.pathname] : undefined;
+                const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
                 if (expected) {
                     let stored = await readStoredSha(cache);
                     if (stored === null) {
@@ -468,8 +464,17 @@ async function networkFirst(req, cache) {
 
 // ----------------------------------------------------------------------------
 // 清单（version.json）：同一加载周期内并发请求合并为单次回源；失败退回缓存清单。
+//   version.json 结构：{ engineVersion, updatedAt, files: { path: { sha256, size } } }
 // ----------------------------------------------------------------------------
 let manifestInflight = null;
+
+// 取某文件的期望 sha256；旧版扁平结构或字段缺失时返回 undefined（回退缓存）。
+function manifestSha(manifest, path) {
+    try {
+        const e = manifest && manifest.files && manifest.files[path];
+        return (e && typeof e.sha256 === "string") ? e.sha256 : undefined;
+    } catch (err) { return undefined; }
+}
 
 function getManifest(cache) {
     if (manifestInflight) return manifestInflight;

@@ -174,7 +174,7 @@
                 });
             }
 
-            // build-info.json 里的 ISO 时间（UTC+00:00）转北京时间 (UTC+8) 显示
+            // version.json 里的 ISO 时间（UTC+00:00）转北京时间 (UTC+8) 显示
             function beijingTime(iso) {
                 var d = new Date(iso);
                 if (isNaN(d.getTime())) { return '未知'; }
@@ -191,7 +191,7 @@
 
             function render(box) {
                 box.innerHTML = row('引擎版本', engineVersion || '加载中…');
-                fetch('/build-info.json', { cache: 'no-store' })
+                fetch('/version.json', { cache: 'no-store' })
                     .then(function (r) {
                         if (!r.ok) { throw new Error('HTTP ' + r.status); }
                         return r.json();
