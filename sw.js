@@ -229,15 +229,15 @@ async function cacheFirstEngine(event, req, url, cache) {
 }
 
 // ============================================================================
-// 飞行下载（LiveDownload）：负责一次引擎文件的"流式 + 续传"下载。
-//   - 用 tee() 把网络响应分成两路：
-//       [a] 直接交给首个页面消费者 —— 这是网络原生流，浏览器会逐步转发，
-//           保证 Emscripten 能拿到真实 "Downloading data... (x/y)" 进度
-//           （修复"首次加载一直 0%"）。
-//       [b] 我们自己读取并缓冲进内存，供刷新后的续传，下载完成写回缓存。
-//   - 刷新后再次请求（下载未完）时，从缓冲回放"已下载字节 + 实时字节"，
-//     不重新下载。
-//   注意：缓冲整份文件（.data 约 50MB）是换取"刷新续传"的代价，下载完即释放。
+// 飞行下载（LiveDownload）：负责一次引擎文件的"流式 + 续传 + 多播"下载。
+//   - SW 持有网络源的【唯一】读取分支，把收到的每一块字节缓冲进内存，并即刻
+//     多播给当前及后续（刷新后）的所有页面消费者。
+//   - 不再把网络源 tee 出一路直接交给首个页面：那样页面刷新/关闭后，无人读取
+//     的那一路会按 Streams 规范把共享源背压/取消，导致下载永远卡在 0% —— 这是
+//     "刷新两次后进度卡死、点重新加载也无效"的根因。
+//   - 首/刷新各页面统一走多播流：新页面一进入先回放"已缓冲字节"，进度立即跳到
+//     已下载比例，再随实时字节续进（"延续之前加载进度"）；下载完成写回缓存。
+//   注意：缓冲整份文件（.data 约 50MB）是换取"刷新续传 + 多播"的代价，下载完即释放。
 // ============================================================================
 const inflight = new Map(); // pathname -> LiveDownload
 
@@ -251,11 +251,9 @@ class LiveDownload {
         this.headers = null;
         this.status = 0;
         this.statusText = "";
-        this.pageStream = null;    // 网络原始 tee 分支 [a]：给首个消费者
-        this.pageStreamTaken = false;
         this.done = false;
         this.failed = false;
-        // 续传消费者（刷新后的页面请求）：push 模型，_start() 每收到一块就喂给它们。
+        // 页面消费者（首/刷新统一）：push 模型，_start() 每收到一块就喂给它们。
         // 不使用 pull 返回 Promise 的续期方式 —— 实测浏览器/Node 在 Promise 兑现后
         // 不再重新调用 pull，会导致刷新续传的流死锁、进度一直为 0。
         this.replayConsumers = new Set();
@@ -272,13 +270,12 @@ class LiveDownload {
             this.headers = resp.headers;
             if (!resp.ok || resp.type !== "basic") throw new Error("HTTP " + resp.status);
             this.total = Number(resp.headers.get("Content-Length") || 0);
-
-            // tee：a 给页面（原生流式，进度可见）；b 供我们缓冲 + 写缓存
-            const branches = resp.body.tee();
-            this.pageStream = branches[0];
+            // 响应头已就绪：通知所有排队等待响应的页面，保证状态码 / 头正确。
             this._resolveHeaderWaiters();
 
-            const reader = branches[1].getReader();
+            // SW 持有网络源的唯一读取分支，逐块缓冲并多播给所有页面消费者。
+            // （不再 tee 出一路给页面，避免刷新/关闭后分支背压/取消导致卡死 0%。）
+            const reader = resp.body.getReader();
             for (;;) {
                 const r = await reader.read();
                 if (r.done) break;
@@ -364,15 +361,14 @@ class LiveDownload {
         } catch (e) { /* 缓存失败不影响本次流式返回 */ }
     }
 
-    // 构造给页面的响应：
-    //   首个消费者 → 直接使用网络原生流 [a]（进度必达）。
-    //   后续消费者（刷新续传）→ 回放已缓冲字节 + 实时字节（即使下载未完，
-    //       也立即返回回放流，避免被 headerWaiters 永久阻塞而进度一直为 0）。
-    //   失败时 reject，让页面侧 fetch 抛错从而走重试/离线提示。
+    // 构造给页面的响应：首/刷新统一走"多播续传流"。
+    //   回放已缓冲字节 + 实时字节（即使下载未完也立即返回并回放，避免被
+    //   headerWaiters 永久阻塞而进度一直为 0）；失败时 reject 走重试/离线。
     respond() {
         const self = this;
-        // 网络响应头还没到（下载尚未开始回源）：先排队等流就绪。
-        if (!this.pageStream && !this.done) {
+        // 网络响应头还没到（下载尚未开始回源）：先排队，头就绪后再给响应，
+        // 保证状态码 / Content-Type 等头信息正确（fetch 失败则 reject）。
+        if (!this.headers && !this.done) {
             return new Promise(function (resolve, reject) {
                 self.headerWaiters.push({
                     resolve: function () { resolve(self.respond()); },
@@ -380,38 +376,15 @@ class LiveDownload {
                 });
             });
         }
-        // 首个消费者：直接把网络原生流 [a] 给它。
-        if (!this.pageStreamTaken && this.pageStream) {
-            this.pageStreamTaken = true;
-            return Promise.resolve(this._buildNetworkResponse());
+        // 已完成但下载失败且一个字节都没收到：明确报错，让引擎 fetch 失败走重试/离线。
+        if (this.done && this.failed && this.received === 0) {
+            return Promise.reject(new Error("engine download failed"));
         }
-        // 已完成/失败：给明确结果。
-        if (this.done) {
-            if (this.failed && this.received === 0) {
-                return Promise.reject(new Error("engine download failed"));
-            }
-            return Promise.resolve(this._buildReplayResponse());
-        }
-        // 下载进行中：后续消费者（刷新续传）→ 回放已缓冲字节 + 实时字节。
+        // 首/刷新各页面统一走多播流：回放已缓冲字节 + 实时字节，进度即刻可见。
         return Promise.resolve(this._buildReplayResponse());
     }
 
-    // 网络原生流响应：浏览器逐步转发到页面，进度可见。
-    // 不设 Content-Length，Emscripten 会回退到 packageSize 计算进度，避免压缩偏差。
-    _buildNetworkResponse() {
-        const headers = new Headers(this.headers || {});
-        headers.delete("Content-Encoding"); // 已解压，避免客户端二次解码
-        headers.delete("Content-Length");
-        headers.set("Cross-Origin-Embedder-Policy", "require-corp");
-        headers.set("Cross-Origin-Opener-Policy", "same-origin");
-        return new Response(this.pageStream, {
-            status: this.status || 200,
-            statusText: this.statusText || "OK",
-            headers: headers
-        });
-    }
-
-    // 续传响应：回放已缓冲字节 + 实时字节（仅刷新后下载未完时使用）。
+    // 多播续传响应（所有页面消费者统一走这里）：回放已缓冲字节 + 实时字节。
     // push 模型：start() 时立即回放已缓冲块；之后 _start() 每收到一块就经
     // _pumpReplays() 推给本流。不用 pull 返回 Promise 续期，规避流死锁。
     _buildReplayResponse() {
