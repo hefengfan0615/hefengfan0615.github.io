@@ -11,23 +11,20 @@
 //      data 是确定性产物，只有 NNUE 真的变了才回源重下 51MB，否则秒用缓存。
 //      version.json 始终"缓存击穿"（时间戳 query + cache:reload）后比对，
 //      确保用的是服务器最新清单，不受 CDN 滞后影响。
-//  [4] 飞行下载（LiveDownload）：data 需重下时把网络响应【直接流式转发】给
-//      页面，进度可见（修复"引擎加载一直 0%"）；刷新页面接着已下载字节续传，
-//      下载完写回缓存，并记录 data 的 sha256 到 meta 供秒级比对。
+//  [4] 引擎大文件需要回源下载时：用【浏览器管理的网络 passthrough】直接把字节
+//      流式给引擎 worker，进度实时可见；后台并行把整份写入缓存供下次秒开。
+//      不再用 SW 内存自建 ReadableStream 流式转发整份 50MB —— 那种"SW 源头流"
+//      在页面刷新/中断后可能被 Chromium 永久悬挂（reader.read() 永不返回也不报错，
+//      进度一直 0%，只能清浏览数据恢复），是"刷新多次后卡 0"的根因。
 //  [5] 所有响应统一注入 COOP/COEP，保证多线程 WASM（SharedArrayBuffer）可用。
 // ============================================================================
 
 "use strict";
 
-const CACHE_NAME = "fengfan-xiangqi-files-v1";
+const CACHE_NAME = "fengfan-xiangqi-files-v2";
 const MANIFEST_PATH = "/version.json";
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
-
-// 飞行下载自愈参数：防止"刷新/回源卡死"后 LiveDownload 被永久复用，进度一直 0%。
-const HEADER_TIMEOUT_MS = 20000; // 回源等响应头最长时间，超过视为回源卡死
-const STALL_TIMEOUT_MS = 30000;  // 读数据 30s 无字节推进视为下载卡死
-const WATCHDOG_MS = 5000;        // 看门狗扫描周期
 
 // 前端界面外壳：小体积，安装时预缓存，保证离线首屏
 const APP_SHELL = [
@@ -47,7 +44,6 @@ function isEngineFile(urlPath) {
 // 安装：预缓存前端外壳并立即 skipWaiting，尽快接管页面。
 // ----------------------------------------------------------------------------
 self.addEventListener("install", function (event) {
-    ensureWatchdog(); // 提前跑看门狗，尽早发现卡死下载
     event.waitUntil(
         (async function () {
             const cache = await caches.open(CACHE_NAME);
@@ -63,7 +59,6 @@ self.addEventListener("install", function (event) {
 // 激活：清理旧结构缓存并立即接管页面。
 // ----------------------------------------------------------------------------
 self.addEventListener("activate", function (event) {
-    ensureWatchdog(); // 兜底再跑看门狗
     event.waitUntil(
         (async function () {
             const keys = await caches.keys();
@@ -161,9 +156,16 @@ async function cacheFirstSWR(req, url, cache) {
 // ----------------------------------------------------------------------------
 async function cacheFirstEngine(event, req, url, cache) {
 
-    // ---- pikafish.data：大文件，Cache First + 哈希校验（meta 秒级比对）----
+    // ---- pikafish.data：大文件，Cache First + 哈希校验 ----
+    // 关键：不再用 SW 内存 ReadableStream 给引擎 worker 流式整份 .data。
+    // （Chromium 对 SW 源头流式响应在页面刷新/异常中断后可能"永久悬挂"——
+    //   worker 的 reader.read() 既不返回数据也不报错，进度一直 0%，只能清浏览数据恢复。
+    //   这正是之前"刷新多次后卡 0、怎么刷新都好不了"的根因。）
+    // 改为：缓存命中且哈希匹配 → 原子返回整份缓存（可靠、秒开、绝不悬挂）；
+    //        缓存过期 / 缺失 → 用"浏览器管理的网络 passthrough"直接流式给 worker，
+    //        进度实时可见，刷新即干净地重新开始，绝不复用悬挂流。
     if (url.pathname === DATA_PATH) {
-        const cached = await cache.match(req);
+        let cached = await cache.match(req);
         if (cached) {
             try {
                 const manifest = await getManifest(cache); // 最新清单（缓存击穿）
@@ -180,8 +182,7 @@ async function cacheFirstEngine(event, req, url, cache) {
                         }
                     }
                     if (stored === expected) return withIsolationHeaders(cached); // 已最新
-                    // 缓存落后于清单：删掉旧文件，走下方回源下载新版。
-                    await cache.delete(req).catch(function () {});
+                    await cache.delete(req).catch(function () {}); // 过期：删掉走回源
                 } else {
                     return withIsolationHeaders(cached); // 拿不到清单：用缓存兜底
                 }
@@ -190,11 +191,24 @@ async function cacheFirstEngine(event, req, url, cache) {
             }
         }
 
-        // 需要更新 / 无缓存：复用/续传在途下载；已失败或卡死则自动换新。
-        // ensureLive 内部会自愈卡死的下载（含正在等头的请求迁到新下载），
-        // 保证之后刷新/点重新加载不再是"进度一直 0%"。
-        const live = ensureLive(url, event);
-        return live.respond(); // 流式：已下载字节立刻给到 + 后续实时续传
+        // 需要下载：浏览器管理的网络 passthrough（不使用 SW 内存流）。
+        try {
+            const resp = await fetch(req, { cache: "reload" });
+            if (!resp.ok || resp.type !== "basic") {
+                const fb = await cache.match(req);
+                if (fb) return withIsolationHeaders(fb);
+                return withIsolationHeaders(resp);
+            }
+            // 后台把整份写入缓存（离线兜底 + 下次秒开）。clone() 两路互相独立：
+            // worker 读一路（实时进度），本路写缓存；worker 中断不影响缓存写入，
+            // 也不会产生"共享源被取消导致背压"的悬挂。
+            event.waitUntil(backgroundCacheData(resp.clone(), cache, url).catch(function () {}));
+            return withIsolationHeaders(resp); // 网络流直接给 worker，进度实时可见
+        } catch (e) {
+            const fb = await cache.match(req);
+            if (fb) return withIsolationHeaders(fb);
+            return new Response(null, { status: 504, statusText: "Network Unavailable" });
+        }
     }
 
     // ---- pikafish.js / pikafish.wasm：小文件，网络优先 ----
@@ -228,283 +242,33 @@ async function cacheFirstEngine(event, req, url, cache) {
     }
 }
 
-// ============================================================================
-// 飞行下载（LiveDownload）：负责一次引擎文件的"流式 + 续传 + 多播"下载。
-//   - SW 持有网络源的【唯一】读取分支，把收到的每一块字节缓冲进内存，并即刻
-//     多播给当前及后续（刷新后）的所有页面消费者。
-//   - 不再把网络源 tee 出一路直接交给首个页面：那样页面刷新/关闭后，无人读取
-//     的那一路会按 Streams 规范把共享源背压/取消，导致下载永远卡在 0% —— 这是
-//     "刷新两次后进度卡死、点重新加载也无效"的根因。
-//   - 首/刷新各页面统一走多播流：新页面一进入先回放"已缓冲字节"，进度立即跳到
-//     已下载比例，再随实时字节续进（"延续之前加载进度"）；下载完成写回缓存。
-//   注意：缓冲整份文件（.data 约 50MB）是换取"刷新续传 + 多播"的代价，下载完即释放。
-// ============================================================================
-const inflight = new Map(); // pathname -> LiveDownload
-
-class LiveDownload {
-    constructor(url) {
-        this.url = url;
-        this.path = url.pathname;
-        this.chunks = [];       // 缓冲：供续传回放 + 完成后写回缓存
-        this.received = 0;
-        this.total = 0;
-        this.headers = null;
-        this.status = 0;
-        this.statusText = "";
-        this.done = false;
-        this.failed = false;
-        this.abandoned = false;
-        this.reader = null;     // 网络源读取分支（供 abandon 时 cancel 中止）
-        this.createdAt = Date.now();
-        this.lastByteAt = this.createdAt;
-        // 页面消费者（首/刷新统一）：push 模型，_start() 每收到一块就喂给它们。
-        // 不使用 pull 返回 Promise 的续期方式 —— 实测浏览器/Node 在 Promise 兑现后
-        // 不再重新调用 pull，会导致刷新续传的流死锁、进度一直为 0。
-        this.replayConsumers = new Set();
-        this.headerWaiters = [];     // 等待响应头的 respond() 调用者（resolve/reject 直存）
-        this.promise = this._start(); // 后台下载 + 写缓存，完成后解析
-    }
-
-    async _start() {
-        inflight.set(this.path, this);
-        try {
-            const resp = await fetch(this.url.href, { cache: "reload" });
-            if (this.abandoned) { /* 已在等待回源期间被看门狗废弃 */ }
-            this.status = resp.status;
-            this.statusText = resp.statusText;
-            this.headers = resp.headers;
-            if (!resp.ok || resp.type !== "basic") throw new Error("HTTP " + resp.status);
-            this.total = Number(resp.headers.get("Content-Length") || 0);
-            // 响应头已就绪：通知所有排队等待响应的页面，保证状态码 / 头正确。
-            this._resolveHeaderWaiters();
-
-            // SW 持有网络源的唯一读取分支，逐块缓冲并多播给所有页面消费者。
-            // （不再 tee 出一路给页面，避免刷新/关闭后分支背压/取消导致卡死 0%。）
-            this.reader = resp.body.getReader();
-            for (;;) {
-                const r = await this.reader.read();
-                if (r.done) break;
-                this.lastByteAt = Date.now();
-                this.chunks.push(r.value);
-                this.received += r.value.byteLength;
-                this._pumpReplays();
-            }
-            if (this.abandoned) return; // 被废弃：不再提交缓存
-            this.done = true;
-            this._pumpReplays();
-            await this._commit();
-        } catch (e) {
-            this.failed = true;
-            this.done = true;
-            this._pumpReplays();
-            this._rejectHeaderWaiters(e);
-        } finally {
-            // 只有自己仍在 inflight 才清理，避免误删看门狗换上的新下载。
-            if (inflight.get(this.path) === this) inflight.delete(this.path);
-        }
-    }
-
-    // 首次捕获到网络响应头，回应所有排队等头的 respond() 调用者。
-    _resolveHeaderWaiters() {
-        const arr = this.headerWaiters;
-        this.headerWaiters = [];
-        for (const w of arr) this._settleWaiter(w, this);
-    }
-
-    _rejectHeaderWaiters(e) {
-        const arr = this.headerWaiters;
-        this.headerWaiters = [];
-        for (const w of arr) {
-            try { w.reject(e); } catch (err) { /* 忽略 */ }
-        }
-    }
-
-    // 把一个排队等头的 waiter 用某个下载实例构造出流式响应交付。
-    _settleWaiter(w, target) {
-        let resp = null;
-        try { resp = target._buildOutgoing(); }
-        catch (e) { try { w.reject(e); return; } catch (_) { return; } }
-        try { w.resolve(resp); } catch (e) { /* 忽略 */ }
-    }
-
-    // 是否已确定卡死：等待响应头过久 / 读数据长时间无推进。
-    isStalled() {
-        if (this.done || this.abandoned) return false;
-        const now = Date.now();
-        if (!this.headers) return (now - this.createdAt) > HEADER_TIMEOUT_MS;
-        return (now - this.lastByteAt) > STALL_TIMEOUT_MS;
-    }
-
-    // 废弃本项目：取消网络读取、标记失败；把仍在等头的请求迁到全新下载上，
-    // 保证"点我重新加载 / 刷新"不会复用这个卡死的下载而一直 0%。
-    //   有等头请求时，就地换上一个全新下载并把它注册到 inflight（避免外面再建
-    //   一次导致重复下载 50MB），同时把这些 waiter 交给新下载续传。
-    abandon() {
-        if (this.abandoned || this.done) return;
-        this.abandoned = true;
-        this.failed = true;
-        if (this.reader) { try { this.reader.cancel().catch(function () {}); } catch (e) { /* 忽略 */ } }
-        // 若已有页面正排队等头，绝不能让他们悬挂：立即换新下载并接管 waiters。
-        if (this.headerWaiters.length) {
-            const replacement = new LiveDownload(this.url);
-            inflight.set(this.path, replacement); // 接管在途位，避免外面新建重复下载
-            this.adoptWaitersFrom(replacement);
-        }
-    }
-
-    // 把调用者的等头 waiter 转交给 target（target 构造响应交付，绝不悬挂）。
-    adoptWaitersFrom(target) {
-        const waiters = this.headerWaiters;
-        this.headerWaiters = [];
-        for (const w of waiters) target._settleWaiter(w, target);
-        target._pumpReplays();
-    }
-
-    // push 模型：把新到/已缓冲的字节喂给所有续传消费者。
-    _pumpReplays() {
-        if (this.abandoned) return;
-        for (const c of Array.from(this.replayConsumers)) this._feedReplay(c);
-    }
-
-    // 喂给单个续传消费者：回放已缓冲块；下载结束后 close/error。
-    _feedReplay(consumer) {
-        const controller = consumer.controller;
-        if (!consumer.active || !controller) return;
-        try {
-            while (consumer.pos < this.chunks.length) {
-                controller.enqueue(this.chunks[consumer.pos++]);
-            }
-            if (this.done) {
-                if (this.failed && this.received === 0) {
-                    controller.error(new Error("engine download failed"));
-                } else {
-                    controller.close();
-                }
-                consumer.active = false;
-                this.replayConsumers.delete(consumer);
-            }
-        } catch (e) {
-            // 消费者已取消（页面刷新 / fetch 中止）：移除即可
-            consumer.active = false;
-            this.replayConsumers.delete(consumer);
-        }
-    }
-
-    async _commit() {
-        if (this.failed || this.received === 0) return;
-        try {
-            const cache = await caches.open(CACHE_NAME);
-            const blob = new Blob(this.chunks);
-            const headers = new Headers(this.headers || {});
-            headers.delete("Content-Encoding"); // body 已是解压后的原始字节
-            headers.delete("Content-Length");
-            headers.delete("Set-Cookie");
-            await cache.put(this.url.href, new Response(blob, {
-                status: this.status || 200,
-                statusText: this.statusText || "OK",
-                headers: headers
-            }));
-            // 大文件 data 额外记录 sha256 到 meta，后续只做字符串比对
-            if (this.path === DATA_PATH) {
-                const buf = new Uint8Array(await blob.arrayBuffer());
-                const sha = await sha256Hex(buf);
-                await cache.put(DATA_META_KEY, new Response(sha, { headers: { "Content-Type": "text/plain" } }))
-                    .catch(function () {});
-            }
-        } catch (e) { /* 缓存失败不影响本次流式返回 */ }
-    }
-
-    // 构造给页面的响应：首/刷新统一走"多播续传流"。
-    //   回放已缓冲字节 + 实时字节（即使下载未完也立即返回并回放，避免被
-    //   headerWaiters 永久阻塞而进度一直为 0）；失败时 reject 走重试/离线。
-    respond() {
-        const self = this;
-        // 网络响应头还没到：先排队，等头就绪后回放。抓不到头（回源卡死）时由
-        // 看门狗 abandon() 迁到新下载 / 终止，绝不让本调用永久悬挂（刷新卡 0% 根因）。
-        if (!this.headers && !this.done && !this.abandoned) {
-            return new Promise(function (resolve, reject) {
-                self.headerWaiters.push({ resolve: resolve, reject: reject });
-            });
-        }
-        try {
-            return Promise.resolve(this._buildOutgoing());
-        } catch (e) {
-            return Promise.reject(e);
-        }
-    }
-
-    // 统一出口：完成但失败且零字节时抛错；否则总是给"多播续传流"。
-    _buildOutgoing() {
-        if (this.done && this.failed && this.received === 0) {
-            throw new Error("engine download failed");
-        }
-        return this._buildReplayResponse();
-    }
-
-    // 多播续传响应（所有页面消费者统一走这里）：回放已缓冲字节 + 实时字节。
-    // push 模型：start() 时立即回放已缓冲块；之后 _start() 每收到一块就经
-    // _pumpReplays() 推给本流。不用 pull 返回 Promise 续期，规避流死锁。
-    _buildReplayResponse() {
-        const self = this;
-        const consumer = { pos: 0, controller: null, active: true };
-        const stream = new ReadableStream({
-            start: function (controller) {
-                consumer.controller = controller;
-                self.replayConsumers.add(consumer);
-                self._feedReplay(consumer); // 立即回放已缓冲字节，进度即刻可见
-            },
-            cancel: function () {
-                consumer.active = false;
-                self.replayConsumers.delete(consumer);
-            }
-        });
-
-        const headers = new Headers(self.headers || {});
-        headers.delete("Content-Encoding");
+// ----------------------------------------------------------------------------
+// 后台缓存：把一份网络响应整份写入 CacheStorage。
+//   浏览器管理的网络响应 clone() 后两路互相独立：worker 读实时字节这一路，
+//   写缓存这路并行完成。worker 中断/刷新不影响本路，也不会悬挂（区别于用手工
+//   tee/自建 SW 内存流去"多播"，后者在刷新中断后会产生永久悬挂的流）。
+// ----------------------------------------------------------------------------
+async function backgroundCacheData(resp, cache, url) {
+    try {
+        const buf = await resp.arrayBuffer(); // 读取整份（实时网络下载）
+        const headers = new Headers(resp.headers);
+        headers.delete("Content-Encoding"); // body 已是解压后的原始字节
         headers.delete("Content-Length");
-        headers.set("Cross-Origin-Embedder-Policy", "require-corp");
-        headers.set("Cross-Origin-Opener-Policy", "same-origin");
-        return new Response(stream, {
-            status: self.status || 200,
-            statusText: self.statusText || "OK",
+        headers.delete("Set-Cookie");
+        await cache.put(url.href, new Response(buf, {
+            status: resp.status || 200,
+            statusText: resp.statusText || "OK",
             headers: headers
-        });
-    }
-}
-
-// 启动（或在途则复用）一个下载；若在途的已失败/卡死，则替换为全新下载。
-// 返回可用的 in-flight 实例，由调用方统一走 live.respond() 交给页面。
-function ensureLive(url, event) {
-    const path = url.pathname;
-    let live = inflight.get(path);
-    if (live && !live.failed && live.isStalled()) {
-        // 卡死：abandon 可能已就地换新并注册到 inflight（有等头请求时），
-        // 也可能只标记失败。两种都重新读一次当前在途位再决定。
-        live.abandon();
-        live = inflight.get(path);
-        if (live === undefined || live.failed) live = null;
-    }
-    if (!live || live.failed) {
-        live = new LiveDownload(url);
-        inflight.set(path, live);
-        if (event) { try { event.waitUntil(live.promise); } catch (e) { /* 忽略 */ } }
-    }
-    return live;
-}
-
-// ----------------------------------------------------------------------------
-// 看门狗：周期性扫描在途下载，废弃"卡死"的实例（等头过久 / 读数据长时间无推进）。
-//   一旦废弃，正在等头的请求会被迁到全新下载上继续，进度恢复正常，刷新不再 0%。
-// ----------------------------------------------------------------------------
-let watchdogTimer = null;
-function ensureWatchdog() {
-    if (watchdogTimer) return;
-    watchdogTimer = setInterval(function () {
-        for (const live of Array.from(inflight.values())) {
-            if (live.done || live.abandoned) continue;
-            if (live.isStalled()) live.abandon();
+        }));
+        // 大文件 data 额外记录 sha256 到 meta，供下次秒级校验命中缓存。
+        if (url.pathname === DATA_PATH) {
+            const sha = await sha256Hex(new Uint8Array(buf));
+            await cache.put(DATA_META_KEY, new Response(sha, {
+                headers: { "Content-Type": "text/plain" }
+            })).catch(function () {});
         }
-    }, WATCHDOG_MS);
+        notifyUpdate();
+    } catch (e) { /* 后台缓存失败不影响本次返回 */ }
 }
 
 // ----------------------------------------------------------------------------

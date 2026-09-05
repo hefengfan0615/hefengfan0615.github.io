@@ -46,8 +46,8 @@
       "size": 87038
     },
     "/sw.js": {
-      "sha256": "bfadc8b19f10d37e7cb289c9ef82e10e9f72eef94c94bb11ee06af1046a053ab",
-      "size": 29895
+      "sha256": "d76333e3f32ea402366001c80fafad89a09de80161cfd1de56d966bc139c0aa1",
+      "size": 19522
     },
     "/wasm/pikafish.data": {
       "sha256": "3cd15292bf8c979884262f57fc723959fc0dea43b4d8d544f88db5ceb2479e24",
@@ -66,5 +66,5 @@
       "size": 15008
     }
   },
-  "updatedAt": "2026-09-05T20:15:03+08:00"
+  "updatedAt": "2026-09-05T15:34:07Z"
 }
