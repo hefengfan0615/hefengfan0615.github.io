@@ -108,42 +108,55 @@ async function serve(event, req, url) {
     // 引擎文件：Cache First + 流式下载 + 续传。
     if (isEngineFile(url.pathname)) return cacheFirstEngine(event, req, url, cache);
 
-    // 前端界面资源：Cache First + SWR。
-    return cacheFirstSWR(req, url, cache);
+    // 前端界面资源：有网就同步哈希校验并回源取最新，离线回退原缓存。
+    return serveAppAsset(req, url, cache);
 }
 
 // ----------------------------------------------------------------------------
-// 前端界面资源：Cache First + stale-while-revalidate。
-//   命中缓存立即返回；后台用 version.json 的 sha256 校验，变了才回源更新。
+// 前端界面资源：网络优先 + 哈希校验（有网必取最新，离线回退原缓存）。
+//   与旧的 "Cache First + SWR"(先回旧缓存、后台再刷)不同：这里先取最新清单
+//   比对 sha256，缓存过期/缺失时【同步】回源，确保"下次打开、有网"一定拿到
+//   最新版本；内容未变的文件直接命中缓存，不浪费流量。离线时清单/回源失败 → 用缓存兜底。
 // ----------------------------------------------------------------------------
-async function cacheFirstSWR(req, url, cache) {
+async function serveAppAsset(req, url, cache) {
     const cached = await cache.match(req);
 
-    const refreshing = (async function () {
+    let expected;
+    try {
+        const manifest = await getManifest(cache); // 网络优先拿最新清单，失败回退缓存
+        expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
+    } catch (e) { expected = undefined; }
+
+    if (expected) {
+        if (cached) {
+            const hash = await sha256Hex(await readAllBytes(cached.clone().body));
+            if (hash === expected) return withIsolationHeaders(cached); // 已最新，秒用
+        }
+        // 缓存缺失或过期：同步回源拿最新，本次加载即生效
         try {
-            const manifest = await getManifest(cache);
-            const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
-            if (expected && cached) {
-                const hash = await sha256Hex(await readAllBytes(cached.clone().body));
-                if (hash === expected) return; // 缓存内容即最新，无需更新
-            }
             const fresh = await fetch(req, { cache: "reload" });
             if (fresh && fresh.ok && fresh.type === "basic") {
                 await cache.put(req, fresh.clone()).catch(function () {});
                 if (cached) notifyUpdate();
+                return withIsolationHeaders(fresh);
             }
-        } catch (e) { /* 忽略，回退缓存即可 */ }
-    })();
-
-    if (cached) {
-        return withIsolationHeaders(cached); // 立即返回缓存（stale）
+        } catch (e) { /* 回源失败(离线)：下面用缓存兜底 */ }
     }
 
-    // 无缓存：等待后台回源完成再返回
-    await refreshing;
-    const freshCached = await cache.match(req);
-    if (freshCached) return withIsolationHeaders(freshCached);
-    return new Response(null, { status: 504, statusText: "Network Unavailable" });
+    // 有缓存：直接返回（短暂取不到清单 / 回源失败时用原缓存）
+    if (cached) return withIsolationHeaders(cached);
+
+    // 无缓存：再尽力直接回源一次（可能清单未取到但网络是可用的）
+    try {
+        const fresh = await fetch(req, { cache: "reload" });
+        if (fresh && fresh.ok && fresh.type === "basic") {
+            await cache.put(req, fresh.clone()).catch(function () {});
+            return withIsolationHeaders(fresh);
+        }
+        return withIsolationHeaders(fresh);
+    } catch (e) {
+        return new Response(null, { status: 504, statusText: "Network Unavailable" });
+    }
 }
 
 // ----------------------------------------------------------------------------
