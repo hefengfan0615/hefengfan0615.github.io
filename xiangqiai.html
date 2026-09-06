@@ -64,16 +64,7 @@
         // 页面未隔离，SharedArrayBuffer 不可用。这里注册 SW，待它接管后一次性刷新，
         // 使文档经 SW 重新导航从而带上 COOP/COEP，达成跨源隔离。
         (function () {
-            if (!('serviceWorker' in navigator)) { return; }
-            var AUTO = 'xiangqi-co-auto';       // 1 = 上一次导航是本脚本注入的自动刷新
-            var COUNT = 'xiangqi-co-count';     // 注入式自动刷新的次数（兜底，防止 SW 无法接管时死循环）
-
-            var isIsolated = function () { return window.crossOriginIsolated === true; };
-            var clearKeys = function () {
-                sessionStorage.removeItem(AUTO);
-                sessionStorage.removeItem(COUNT);
-            };
-
+            // ========================== SAB 弹窗 ==========================
             // 自动检测 SAB：只有浏览器【确实无法达成跨源隔离 / 无 SharedArrayBuffer】
             // 时才弹窗。样式与原"引擎版本更新"弹窗（Element MessageBox 风格）一致。
             // 不设"一次性守卫"：每次刷新/加载，只要仍不支持 SAB 就再次弹窗。
@@ -136,47 +127,122 @@
                 } catch (e) { /* 渲染失败则静默 */ }
             }
 
+            // body 可能尚未解析完成（本脚本位于 <head>），等到 DOM 就绪再挂载弹窗
+            function showSAB() {
+                if (document.body) { sabUnsupported(); return; }
+                var onReady = function () {
+                    document.removeEventListener('DOMContentLoaded', onReady);
+                    sabUnsupported();
+                };
+                document.addEventListener('DOMContentLoaded', onReady);
+            }
+
+            // ========================== 引导逻辑 ==========================
+            var AUTO = 'xiangqi-co-auto';       // 1 = 上一次导航是本脚本注入的自动刷新
+            var COUNT = 'xiangqi-co-count';     // 注入式自动刷新的次数（兜底，防止 SW 无法接管时死循环）
+
+            function isIsolated() { return window.crossOriginIsolated === true; }
+            function clearKeys() {
+                try {
+                    sessionStorage.removeItem(AUTO);
+                    sessionStorage.removeItem(COUNT);
+                } catch (e) { /* 隐私模式下可能抛错，忽略 */ }
+            }
+            function getN() {
+                try { var x = parseInt(sessionStorage.getItem(COUNT) || '0', 10); return isNaN(x) ? 0 : x; }
+                catch (e) { return 0; }
+            }
+
             // 已隔离：本次会话已完成引导，清除全部标记收工。
             if (isIsolated()) { clearKeys(); return; }
 
-            // 判断本页文档是否【已由 Service Worker 提供】：
-            //   - true  ：本次导航已由 SW 注入 COOP/COEP，却仍未隔离 → 判定浏览器不支持 SAB。
-            //   - false ：本次文档未经 SW（首次加载/无 SW），需注册 SW 并在其接管后刷新一次。
-            // 必须用脚本顶部的同步值；不能用 claim 中途变动的 controller，否则会把"还在转向
-            // 隔离的半途状态"误判为不支持。SW 在 activate 的 waitUntil 里做了 clients.claim()，
-            // 因此 ready resolve 之后再度导航必然由 SW 提供，controller 一定在页面加载时就是 SW。
-            var controllerAtStart = navigator.serviceWorker.controller;
+            // ① 连 Service Worker 都没有：GitHub Pages 无法下发 COOP/COEP 头，
+            //    SAB 永远无法启用 → 直接弹窗，而不是一直卡在"加载 0%"
+            if (!('serviceWorker' in navigator)) { showSAB(); return; }
 
-            // 已由 SW 提供过（或重试耗尽）仍未隔离 → 弹窗。用户刷新后若仍不支持，同样命中这里。
-            var fromAuto = sessionStorage.getItem(AUTO) === '1';
+            // 本页文档是否【已由 Service Worker 提供】：若为 true 说明本次导航已注入过
+            // COOP/COEP，却仍未隔离 → 判定浏览器不支持 SAB。必须用脚本顶部的同步值，
+            // 不能用 claim 中途变动的 controller，否则会把"还在转向隔离"误判为不支持。
+            var controllerAtStart = navigator.serviceWorker.controller !== null;
+            var fromAuto = false;
+            try { fromAuto = sessionStorage.getItem(AUTO) === '1'; } catch (e) { /***/ }
+
+            // ② 已由 SW 提供过（或上次已注入自动刷新）仍未隔离 → 弹窗。
+            //    用户刷新后若仍不支持，同样命中这里，保证每次刷新都会再次弹窗。
             if (fromAuto || controllerAtStart) {
-                sabUnsupported();
+                showSAB();
                 clearKeys();
                 return;
             }
 
-            // 首次加载、SW 尚未接管：注册 SW，就绪（含 skipWaiting + clients.claim）后注入一次
-            // 刷新，使后续文档由 SW 提供从而携带 COOP/COEP。带次数上限兜底，防止极端环境下卡死。
-            var n = parseInt(sessionStorage.getItem(COUNT) || '0', 10);
-            if (n >= 3) { sabUnsupported(); clearKeys(); return; }
+            // ③ 首次加载、SW 尚未接管：注册 SW，接管后刷新一次以注入 COOP/COEP。
+            var n = getN();
+            if (n >= 3) { showSAB(); clearKeys(); return; }
+
+            var settled = false;   // 已进入刷新/收尾，后续不再弹窗
+            var watchdog = null;
+            function fireWatchdog() {
+                if (settled) { return; }
+                // 既未隔离、又迟迟没进入接管/刷新 → SAB 无法启用 → 弹窗兜底，避免卡死在 0%
+                if (!isIsolated() && !navigator.serviceWorker.controller) {
+                    settled = true;
+                    showSAB();
+                    clearKeys();
+                }
+            }
+            // 守护定时器：处理"SW 注册被覆盖挂起 / 一直无法接管"等异常环境
+            function armWatchdog() {
+                if (watchdog) { clearTimeout(watchdog); }
+                watchdog = setTimeout(fireWatchdog, 6000);
+            }
+            armWatchdog();
+
+            function flushWatchdog() { if (watchdog) { clearTimeout(watchdog); watchdog = null; } }
 
             function doReload() {
-                sessionStorage.setItem(AUTO, '1');
-                sessionStorage.setItem(COUNT, String(n + 1));
+                settled = true;
+                flushWatchdog();
+                try {
+                    sessionStorage.setItem(AUTO, '1');
+                    sessionStorage.setItem(COUNT, String(getN() + 1));
+                } catch (e) { /* 忽略 */ }
                 location.reload();
+            }
+
+            // SW 成功接管：刷新一次让本页由 SW 提供，从而带上 COOP/COEP。
+            navigator.serviceWorker.addEventListener('controllerchange', function () {
+                if (!settled && navigator.serviceWorker.controller) {
+                    beforeReload();
+                }
+            });
+            function beforeReload() {
+                // ready/接管已就绪：取消守护，执行注入式刷新
+                settled = true;
+                flushWatchdog();
+                doReload();
             }
 
             try {
                 navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function () {
+                    armWatchdog(); // register 已推进，重置计时（装 SW 过程也算进度）
                     navigator.serviceWorker.ready.then(function () {
-                        if (navigator.serviceWorker.controller) { doReload(); return; }
-                        // SW 已激活但当前 client 尚未建立 controller：等接管事件，兜底定时再刷
-                        navigator.serviceWorker.addEventListener('controllerchange', doReload);
-                        setTimeout(function () { if (!isIsolated()) doReload(); }, 300);
-                    }).catch(function () { sabUnsupported(); });
-                }).catch(function () { sabUnsupported(); });
+                        if (settled) { return; }
+                        if (navigator.serviceWorker.controller) { beforeReload(); return; }
+                        // 已激活但当前 client 尚未建立 controller：等 controllerchange，并给定时兜底
+                        setTimeout(function () {
+                            if (!settled && navigator.serviceWorker.controller) { beforeReload(); }
+                            else if (!settled && !isIsolated()) { doReload(); }
+                        }, 1200);
+                        // 若 1200ms 后仍未接管但页面仍未隔离 → doReload 再试一次；
+                        // 下次加载若仍未隔离会命中 ② 直接弹窗，不会无限循环。
+                    }).catch(function () {
+                        if (!settled) { settled = true; flushWatchdog(); showSAB(); }
+                    });
+                }).catch(function () {
+                    if (!settled) { settled = true; flushWatchdog(); showSAB(); }
+                });
             } catch (e) {
-                sabUnsupported();
+                settled = true; flushWatchdog(); showSAB();
             }
         })();
     </script>
