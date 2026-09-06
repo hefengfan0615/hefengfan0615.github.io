@@ -300,14 +300,17 @@ async function readStoredSha(cache) {
 }
 
 // ============================================================================
-// .data 大文件统一下载入口：单实例下载锁。
-//   关键解决：刷新会导致多份 51MB 并发下载抢占带宽（每刷新一份新下载、旧页面的
-//   waitUntil 后台下载仍未结束），越刷越慢、最后贴近 0、只能开新页才恢复。
-//   因此规定：同一时刻【只有一个】下载任务。缓存不满足时，谁先到谁当下载发起者
-//   （网络直通流给 worker，实时进度）；期间其它请求在锁上等待，等后台把整份写入
-//   缓存后用缓存出波特（不再各自新开下载）。锁在后台写缓存完成后自动释放。
+// .data 大文件统一下载：单实例下载会话 + 实时扇出。
+//   同时解决两个问题：
+//   [1] 刷新并发多份 51MB 抢占带宽（越刷越慢、贴近 0、只能开新页才恢复）——
+//       同一时刻【只有一个】下载会话，绝不重复回源。
+//   [2] 下载途中刷新，新页面只能干等缓存、进度一直 0——会话把实时字节【扇出】给所有
+//       页面，刷新后新页面立刻订阅同一份下载，进度从当前位置继续走（不再退回 0）。
+//   这一份下载由 SW 亲自读：分批交给所有订阅页面（实时进度），读完把整份原子写入
+//   CacheStorage 供下次秒开。用 event.waitUntil(session.done) 兜住，保证刷新期间
+//   下载也不会被打断（SW 不会提前终止）。
 // ============================================================================
-let dataDownloadInFlight = null;
+let dataSession = null;
 
 // 尝试从缓存提供 .data：命中且与最新清单哈希一致 → 返回 Response；否则返回 null。
 async function tryServeDataFromCache(req, url, cache) {
@@ -337,7 +340,7 @@ async function tryServeDataFromCache(req, url, cache) {
     }
 }
 
-// 浏览器管理的网络 passthrough：直接流式给 worker（实时进度），后台并行写整份缓存。
+// 网络直通兜底（下载会话失败 / 极端竞态时用）：直接流式给 worker，后台并行写缓存。
 async function directPassthrough(event, req, url, cache) {
     try {
         const resp = await fetch(req, { cache: "reload" });
@@ -347,7 +350,7 @@ async function directPassthrough(event, req, url, cache) {
             return resp;
         }
         event.waitUntil(backgroundCacheData(resp.clone(), cache, url).catch(function () {}));
-        return resp; // 网络流直接给 worker，进度实时可见
+        return resp;
     } catch (e) {
         const fb = await cache.match(req);
         if (fb) return fb;
@@ -355,55 +358,148 @@ async function directPassthrough(event, req, url, cache) {
     }
 }
 
+// 同步创建唯一下载会话（构造函数无 await，保证并发请求原子地共享同一会话）。
+// 返回 session，其中：
+//   ready   promise —— 网络 fetch 结果确定（ok 的真假）；
+//   done    promise —— 整个下载 + 写缓存结束（无论成败）；
+//   ok     是否成功拿到网络流；
+//   loopDone  同步标记 —— 数据读取结束，此后新订阅者应改走缓存；
+//   subs    订阅者集合（{ controller }），实时扇出对象。
+function startDataSession(url, cache) {
+    const session = {
+        ready: null, resolveReady: null,
+        done: null, resolveDone: null,
+        ok: false,
+        loopDone: false,
+        expectedSize: 0,
+        subs: new Set()
+    };
+    session.ready = new Promise(function (r) { session.resolveReady = r; });
+    session.done = new Promise(function (r) { session.resolveDone = r; });
+
+    (async function () {
+        let chunks = [];
+        let total = 0;
+        try {
+            const resp = await fetch(url.href, { cache: "reload" });
+            if (!(resp && resp.ok && resp.type === "basic")) {
+                session.resolveReady(); // ok=false，走兜底
+                return;
+            }
+            session.ok = true;
+            // 用清单里的 size 作为 Content-Length 基线（保证进度百分比正确）
+            try {
+                const m = await getManifest(cache);
+                const e = m && m.files && m.files[url.pathname];
+                session.expectedSize = (e && e.size) || 0;
+            } catch (err) {}
+            session.resolveReady(); // 网络已通，订阅者可开始收数据
+
+            const reader = resp.body.getReader();
+            for (;;) {
+                const r = await reader.read();
+                if (r.done) break;
+                chunks.push(r.value);
+                total += r.value.byteLength;
+                // 实时扇出：发给所有在订阅的页面（被移除/报错的订阅剔除，绝不暂停下载）
+                for (const s of session.subs) {
+                    try { s.controller.enqueue(r.value); }
+                    catch (e) { session.subs.delete(s); }
+                }
+            }
+            session.loopDone = true; // 读完：此后新订阅者走缓存
+            await writeDataCache(url.href, chunks, total, cache);
+        } catch (e) {
+            // 网络中断等异常：交由下方 finally 收尾，页面订阅流会关闭并退化为读缓存
+        } finally {
+            for (const s of session.subs) {
+                try { s.controller.close(); } catch (e) {}
+            }
+            session.subs.clear();
+            dataSession = null;     // 释放，允许后续新下载
+            session.resolveDone();
+        }
+    })();
+
+    return session;
+}
+
+// 把内存中已下载的整份 .data 原子写入 CacheStorage（流式入缓存，避免二次拷贝大块内存）。
+async function writeDataCache(href, chunks, total, cache) {
+    let i = 0;
+    const body = new ReadableStream({
+        pull: function (c) {
+            if (i < chunks.length) { c.enqueue(chunks[i++]); }
+            else { c.close(); }
+        }
+    });
+    const resp = new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "Content-Type": "application/octet-stream", "Content-Length": String(total) }
+    });
+    await cache.put(href, resp).catch(function () {});
+    // meta 仅用于下次秒级校验命中缓存
+    try {
+        const full = new Uint8Array(total);
+        let off = 0;
+        for (const c of chunks) { full.set(c, off); off += c.byteLength; }
+        const sha = await sha256Hex(full);
+        await cache.put(DATA_META_KEY, new Response(sha, {
+            headers: { "Content-Type": "text/plain" }
+        })).catch(function () {});
+    } catch (e) { /* 忽略，下次命中不了就重下 */ }
+    notifyUpdate();
+}
+
+// 订阅实时流：在 start() 中【同步】登记进会话。调用后随即必须【无 await】复查 loopDone，
+// 才能保证“订阅太晚拿 0 字节”的竞态不会发生。
+function makeSubscriberStream(session) {
+    const entry = {};
+    const stream = new ReadableStream({
+        start: function (controller) { entry.controller = controller; session.subs.add(entry); },
+        cancel: function () { session.subs.delete(entry); }
+    });
+    return stream;
+}
+
 async function getDataResponse(event, req, url, cache) {
     // 1) 缓存命中且最新 → 秒用，绝不重下
     const fromCache = await tryServeDataFromCache(req, url, cache);
     if (fromCache) return withIsolationHeaders(fromCache);
 
-    // 2) 已有唯一下载任务在跑 → 等待其完成（含后台写缓存），从缓存拿，不开新下载
-    if (dataDownloadInFlight) {
-        const WAIT_MS = 2 * 60 * 1000;
-        const finishing = dataDownloadInFlight
-            .then(function () {}, function () {}); // 无论成败都放行
-        await Promise.race([
-            finishing,
-            new Promise(function (r) { setTimeout(r, WAIT_MS); }) // 兜底超时，防悬挂
-        ]);
-        const doneCache = await cache.match(req);
-        if (doneCache) return withIsolationHeaders(doneCache);
-        // 下载未成功（超时 / 失败）：网络直通兜底（罕见）
+    // 2) 需要下载：原子共享唯一会话（同步构建，杜绝并发各自回源）；并钉住它的生命周期，
+    //    用 event.waitUntil 保证刷新期间 SW 不提前终止、下载不断。
+    if (!dataSession) dataSession = startDataSession(url, cache);
+    const session = dataSession;
+    event.waitUntil(session.done);
+
+    // 3) 等网络结果确定：成功可订阅；失败则走缓存 / 网络直通兜底
+    await session.ready;
+    if (!session.ok) {
+        const fb = await cache.match(url.href);
+        if (fb) return withIsolationHeaders(fb);
         return withIsolationHeaders(await directPassthrough(event, req, url, cache));
     }
 
-    // 3) 本请求充当唯一下载发起者：先占锁，后台写缓存完成后自动释放
-    let resolveDownload;
-    dataDownloadInFlight = new Promise(function (res) { resolveDownload = res; });
-    dataDownloadInFlight.then(
-        function () { dataDownloadInFlight = null; },
-        function () { dataDownloadInFlight = null; }
-    );
-
-    try {
-        const resp = await fetch(req, { cache: "reload" });
-        if (!resp.ok || resp.type !== "basic") {
-            resolveDownload(); // 失败：释放锁，允许下次重试
-            const fb = await cache.match(req);
-            if (fb) return withIsolationHeaders(fb);
-            return withIsolationHeaders(resp);
-        }
-        // worker 走网络直通（实时进度）；后台写缓存，写完后 resolve 锁通知等待者。
-        // backgroundCacheData 内部 try/catch 保证必然 settle，故锁必然释放。
-        const bg = backgroundCacheData(resp.clone(), cache, url)
-            .catch(function () {})
-            .then(function () { resolveDownload(); });
-        event.waitUntil(bg);
-        return withIsolationHeaders(resp); // 发起者：直接网络流，进度实时可见
-    } catch (e) {
-        resolveDownload(); // 异常：释放锁
-        const fb = await cache.match(req);
-        if (fb) return withIsolationHeaders(fb);
-        return new Response(null, { status: 504, statusText: "Network Unavailable" });
+    // 4) 订阅实时流：start() 已同步登记进 session.subs。
+    const stream = makeSubscriberStream(session);
+    if (session.loopDone) {
+        // 登记那一刻下载恰好已读完：此订阅拿不到数据 → 退订，等缓存落盘后从缓存出波
+        stream.cancel().catch(function () {});
+        await session.done;
+        const c = await cache.match(url.href);
+        if (c) return withIsolationHeaders(c);
+        return withIsolationHeaders(await directPassthrough(event, req, url, cache));
     }
+
+    const headers = { "Content-Type": "application/octet-stream" };
+    if (session.expectedSize > 0) headers["Content-Length"] = String(session.expectedSize);
+    return withIsolationHeaders(new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: headers
+    }));
 }
 
 // ----------------------------------------------------------------------------
