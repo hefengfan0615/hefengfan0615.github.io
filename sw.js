@@ -385,6 +385,7 @@ function startDataSession(url, cache) {
         done: null, resolveDone: null,
         ok: false,
         loopDone: false,
+        completed: false,
         expectedSize: 0,
         chunks: [],
         signal: null, resolveSignal: null,
@@ -412,18 +413,24 @@ function startDataSession(url, cache) {
             session.resolveReady(); // 网络已通，订阅者可开始收数据
 
             const reader = resp.body.getReader();
+            let reachedEOF = false;
             for (;;) {
                 const r = await reader.read();
-                if (r.done) break;
+                if (r.done) { reachedEOF = true; break; }
                 session.chunks.push(r.value);
                 total += r.value.byteLength;
                 kickSignal(session); // 唤醒所有等待的订阅者去读新一批数据
             }
-            session.loopDone = true; // 读完：数据已完整缓冲
-            await writeDataCache(url.href, session.chunks, total, cache);
+            // 仅当完整读到流末尾且字节数与清单期望一致才算完成；否则视为失败，
+            // 绝不把截断的文件交给引擎（避免读取 NNUE 越界 → memory access out of bounds）。
+            if (reachedEOF && (session.expectedSize === 0 || total >= session.expectedSize)) {
+                session.completed = true;
+                await writeDataCache(url.href, session.chunks, total, cache);
+            }
         } catch (e) {
             // 网络中断等异常：交由 finally 收尾，订阅流读到已有数据后关闭
         } finally {
+            if (!session.completed && dataSession === session) dataSession = null; // 失败：下次请求重开新会话下载
             session.loopDone = true;
             kickSignal(session);
             session.resolveDone();
@@ -482,7 +489,11 @@ function makeSubscriberStream(session) {
                 while (entry.idx < session.chunks.length) {
                     controller.enqueue(session.chunks[entry.idx++]);
                 }
-                if (session.loopDone) { controller.close(); return; }
+                if (session.loopDone) {
+                    if (session.completed) { controller.close(); return; }
+                    // 下载未完成：主动报错，不把截断文件当成功发给引擎
+                    controller.error(new Error("engine data download incomplete")); return;
+                }
                 await session.signal; // 等下一批数据或结束，再回检
             })();
         },
