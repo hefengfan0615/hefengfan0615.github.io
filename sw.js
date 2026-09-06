@@ -165,50 +165,7 @@ async function cacheFirstEngine(event, req, url, cache) {
     //        缓存过期 / 缺失 → 用"浏览器管理的网络 passthrough"直接流式给 worker，
     //        进度实时可见，刷新即干净地重新开始，绝不复用悬挂流。
     if (url.pathname === DATA_PATH) {
-        let cached = await cache.match(req);
-        if (cached) {
-            try {
-                const manifest = await getManifest(cache); // 最新清单（缓存击穿）
-                const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
-                if (expected) {
-                    let stored = await readStoredSha(cache);
-                    if (stored === null) {
-                        // 旧版本缓存没有 meta：一次性全量哈希补写，避免盲目重下 51MB
-                        stored = await sha256Hex(await readAllBytes(cached.clone().body));
-                        if (stored) {
-                            await cache.put(DATA_META_KEY, new Response(stored, {
-                                headers: { "Content-Type": "text/plain" }
-                            })).catch(function () {});
-                        }
-                    }
-                    if (stored === expected) return withIsolationHeaders(cached); // 已最新
-                    await cache.delete(req).catch(function () {}); // 过期：删掉走回源
-                } else {
-                    return withIsolationHeaders(cached); // 拿不到清单：用缓存兜底
-                }
-            } catch (e) {
-                return withIsolationHeaders(cached); // 校验出错（如离线）：回退缓存
-            }
-        }
-
-        // 需要下载：浏览器管理的网络 passthrough（不使用 SW 内存流）。
-        try {
-            const resp = await fetch(req, { cache: "reload" });
-            if (!resp.ok || resp.type !== "basic") {
-                const fb = await cache.match(req);
-                if (fb) return withIsolationHeaders(fb);
-                return withIsolationHeaders(resp);
-            }
-            // 后台把整份写入缓存（离线兜底 + 下次秒开）。clone() 两路互相独立：
-            // worker 读一路（实时进度），本路写缓存；worker 中断不影响缓存写入，
-            // 也不会产生"共享源被取消导致背压"的悬挂。
-            event.waitUntil(backgroundCacheData(resp.clone(), cache, url).catch(function () {}));
-            return withIsolationHeaders(resp); // 网络流直接给 worker，进度实时可见
-        } catch (e) {
-            const fb = await cache.match(req);
-            if (fb) return withIsolationHeaders(fb);
-            return new Response(null, { status: 504, statusText: "Network Unavailable" });
-        }
+        return getDataResponse(event, req, url, cache);
     }
 
     // ---- pikafish.js / pikafish.wasm：小文件，网络优先 ----
@@ -340,6 +297,113 @@ async function readStoredSha(cache) {
         if (r) return (await r.text()).trim();
     } catch (e) { /* 忽略 */ }
     return null;
+}
+
+// ============================================================================
+// .data 大文件统一下载入口：单实例下载锁。
+//   关键解决：刷新会导致多份 51MB 并发下载抢占带宽（每刷新一份新下载、旧页面的
+//   waitUntil 后台下载仍未结束），越刷越慢、最后贴近 0、只能开新页才恢复。
+//   因此规定：同一时刻【只有一个】下载任务。缓存不满足时，谁先到谁当下载发起者
+//   （网络直通流给 worker，实时进度）；期间其它请求在锁上等待，等后台把整份写入
+//   缓存后用缓存出波特（不再各自新开下载）。锁在后台写缓存完成后自动释放。
+// ============================================================================
+let dataDownloadInFlight = null;
+
+// 尝试从缓存提供 .data：命中且与最新清单哈希一致 → 返回 Response；否则返回 null。
+async function tryServeDataFromCache(req, url, cache) {
+    const cached = await cache.match(req);
+    if (!cached) return null;
+    try {
+        const manifest = await getManifest(cache); // 最新清单（缓存击穿）
+        const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
+        if (expected) {
+            let stored = await readStoredSha(cache);
+            if (stored === null) {
+                // 旧版本缓存没有 meta：一次性全量哈希补写，避免盲目重下 51MB
+                stored = await sha256Hex(await readAllBytes(cached.clone().body));
+                if (stored) {
+                    await cache.put(DATA_META_KEY, new Response(stored, {
+                        headers: { "Content-Type": "text/plain" }
+                    })).catch(function () {});
+                }
+            }
+            if (stored === expected) return cached;          // 已最新：秒用
+            await cache.delete(req).catch(function () {});   // 过期：删掉走回源
+            return null;
+        }
+        return cached; // 拿不到清单：用缓存兜底
+    } catch (e) {
+        return cached; // 校验出错（如离线）：回退缓存
+    }
+}
+
+// 浏览器管理的网络 passthrough：直接流式给 worker（实时进度），后台并行写整份缓存。
+async function directPassthrough(event, req, url, cache) {
+    try {
+        const resp = await fetch(req, { cache: "reload" });
+        if (!resp.ok || resp.type !== "basic") {
+            const fb = await cache.match(req);
+            if (fb) return fb;
+            return resp;
+        }
+        event.waitUntil(backgroundCacheData(resp.clone(), cache, url).catch(function () {}));
+        return resp; // 网络流直接给 worker，进度实时可见
+    } catch (e) {
+        const fb = await cache.match(req);
+        if (fb) return fb;
+        return new Response(null, { status: 504, statusText: "Network Unavailable" });
+    }
+}
+
+async function getDataResponse(event, req, url, cache) {
+    // 1) 缓存命中且最新 → 秒用，绝不重下
+    const fromCache = await tryServeDataFromCache(req, url, cache);
+    if (fromCache) return withIsolationHeaders(fromCache);
+
+    // 2) 已有唯一下载任务在跑 → 等待其完成（含后台写缓存），从缓存拿，不开新下载
+    if (dataDownloadInFlight) {
+        const WAIT_MS = 2 * 60 * 1000;
+        const finishing = dataDownloadInFlight
+            .then(function () {}, function () {}); // 无论成败都放行
+        await Promise.race([
+            finishing,
+            new Promise(function (r) { setTimeout(r, WAIT_MS); }) // 兜底超时，防悬挂
+        ]);
+        const doneCache = await cache.match(req);
+        if (doneCache) return withIsolationHeaders(doneCache);
+        // 下载未成功（超时 / 失败）：网络直通兜底（罕见）
+        return withIsolationHeaders(await directPassthrough(event, req, url, cache));
+    }
+
+    // 3) 本请求充当唯一下载发起者：先占锁，后台写缓存完成后自动释放
+    let resolveDownload;
+    dataDownloadInFlight = new Promise(function (res) { resolveDownload = res; });
+    dataDownloadInFlight.then(
+        function () { dataDownloadInFlight = null; },
+        function () { dataDownloadInFlight = null; }
+    );
+
+    try {
+        const resp = await fetch(req, { cache: "reload" });
+        if (!resp.ok || resp.type !== "basic") {
+            resolveDownload(); // 失败：释放锁，允许下次重试
+            const fb = await cache.match(req);
+            if (fb) return withIsolationHeaders(fb);
+            return withIsolationHeaders(resp);
+        }
+        // worker 走网络直通（实时进度）；后台写缓存，写完后 resolve 锁通知等待者。
+        // backgroundCacheData 内部 try/catch 保证必然 settle，故锁必然释放。
+        const bg = backgroundCacheData(resp.clone(), cache, url)
+            .catch(function () {})
+            .then(function () { resolveDownload(); });
+        event.waitUntil(bg);
+        return withIsolationHeaders(resp); // 发起者：直接网络流，进度实时可见
+    } catch (e) {
+        resolveDownload(); // 异常：释放锁
+        const fb = await cache.match(req);
+        if (fb) return withIsolationHeaders(fb);
+        return new Response(null, { status: 504, statusText: "Network Unavailable" });
+    }
 }
 
 // ----------------------------------------------------------------------------

@@ -46,8 +46,8 @@
       "size": 87038
     },
     "/sw.js": {
-      "sha256": "d76333e3f32ea402366001c80fafad89a09de80161cfd1de56d966bc139c0aa1",
-      "size": 19522
+      "sha256": "afb0e4967be967f24c658cdb37fa4c41622dcd78cf52d75336c6095683fcb411",
+      "size": 22433
     },
     "/wasm/pikafish.data": {
       "sha256": "3cd15292bf8c979884262f57fc723959fc0dea43b4d8d544f88db5ceb2479e24",
