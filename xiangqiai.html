@@ -66,86 +66,117 @@
         (function () {
             if (!('serviceWorker' in navigator)) { return; }
             var AUTO = 'xiangqi-co-auto';       // 1 = 上一次导航是本脚本注入的自动刷新
-            var COUNT = 'xiangqi-co-count';     // 注入式自动刷新的次数（用于兜住恶性循环）
-            var LAST = 'xiangqi-co-last';       // 上一次自动刷新的时间戳（简单限流）
-            var MIN_MS = 1500;                  // 自动刷新的最小间隔
-            var MAX_AUTO = 6;                   // 自动刷新次数上限，防止隔离迟迟不来时无限刷新
+            var COUNT = 'xiangqi-co-count';     // 注入式自动刷新的次数（兜底，防止 SW 无法接管时死循环）
 
-            function isIsolated() { return window.crossOriginIsolated === true; }
-            function clearKeys() {
+            var isIsolated = function () { return window.crossOriginIsolated === true; };
+            var clearKeys = function () {
                 sessionStorage.removeItem(AUTO);
                 sessionStorage.removeItem(COUNT);
-                sessionStorage.removeItem(LAST);
-            }
+            };
 
             // 自动检测 SAB：只有浏览器【确实无法达成跨源隔离 / 无 SharedArrayBuffer】
-            // 时才弹窗提示换浏览器。仅在隔离引导的自动刷新预算耗尽后仍未隔离才触发，
-            // 首次加载（SW 未接管、尚未隔离的过渡态）绝不会误报。全程只弹一次。
+            // 时才弹窗。样式与原"引擎版本更新"弹窗（Element MessageBox 风格）一致。
+            // 不设"一次性守卫"：每次刷新/加载，只要仍不支持 SAB 就再次弹窗。
             function sabUnsupported() {
-                var warned = false;
-                try { warned = localStorage.getItem('xiangqi-sab-warned') === '1'; } catch (e) {}
-                if (warned) { return; }
-                try { localStorage.setItem('xiangqi-sab-warned', '1'); } catch (e) {}
-                try { window.alert('您的浏览器不支持SAB技术，请换一个浏览器试试吧~'); } catch (e) {}
+                if (document.getElementById('xiangqi-sab-modal')) { return; }
+                try {
+                    // 复用同一份 MessageBox 样式（对齐原弹窗），首次注入后全局生效
+                    if (!document.getElementById('xiangqi-sab-style')) {
+                        var st = document.createElement('style');
+                        st.id = 'xiangqi-sab-style';
+                        st.textContent =
+                            '.xq-overlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.5);' +
+                            'display:flex;align-items:center;justify-content:center;overflow:auto;' +
+                            'box-sizing:border-box;padding:16px;}' +
+                            '.xq-mbox{width:420px;max-width:92vw;background:#fff;border-radius:6px;' +
+                            'box-shadow:0 12px 32px 4px rgba(0,0,0,.12),0 8px 20px rgba(0,0,0,.08);' +
+                            'overflow:hidden;margin:auto;}' +
+                            '.xq-mbox__header{padding:15px 15px 5px;}' +
+                            '.xq-mbox__title{font-size:16px;line-height:24px;color:#303133;font-weight:600;}' +
+                            '.xq-mbox__content{padding:6px 15px 0;}' +
+                            '.xq-mbox__message{font-size:14px;line-height:1.6;color:#606266;}' +
+                            '.xq-mbox__btns{padding:12px 15px 15px;text-align:right;}' +
+                            '.xq-btn{display:inline-block;margin-left:8px;height:32px;padding:0 15px;' +
+                            'font-size:14px;border:none;border-radius:4px;cursor:pointer;' +
+                            'font-family:inherit;line-height:32px;box-sizing:border-box;}' +
+                            '.xq-btn--primary{background:#409eff;color:#fff;}' +
+                            '.xq-btn--primary:hover{background:#66b1ff;}';
+                        document.head.appendChild(st);
+                    }
+
+                    var ov = document.createElement('div');
+                    ov.id = 'xiangqi-sab-modal';
+                    ov.className = 'xq-overlay';
+                    var box = document.createElement('div');
+                    box.className = 'xq-mbox';
+                    box.setAttribute('role', 'dialog');
+                    var hd = document.createElement('div');
+                    hd.className = 'xq-mbox__header';
+                    var title = document.createElement('div');
+                    title.className = 'xq-mbox__title';
+                    title.textContent = '提示';
+                    hd.appendChild(title);
+                    var ct = document.createElement('div');
+                    ct.className = 'xq-mbox__content';
+                    var msg = document.createElement('div');
+                    msg.className = 'xq-mbox__message';
+                    msg.textContent = '您的浏览器不支持SAB技术，请换一个浏览器试试吧~';
+                    ct.appendChild(msg);
+                    var btns = document.createElement('div');
+                    btns.className = 'xq-mbox__btns';
+                    var ok = document.createElement('button');
+                    ok.className = 'xq-btn xq-btn--primary';
+                    ok.textContent = '知道了';
+                    ok.type = 'button';
+                    ok.onclick = function () { try { document.body.removeChild(ov); } catch (e) {} };
+                    btns.appendChild(ok);
+                    box.appendChild(hd); box.appendChild(ct); box.appendChild(btns);
+                    ov.appendChild(box);
+                    document.body.appendChild(ov);
+                } catch (e) { /* 渲染失败则静默 */ }
             }
 
-            // 已隔离：本次会话完成，清除全部遗留标记便于后续环境变化时重走引导
+            // 已隔离：本次会话已完成引导，清除全部标记收工。
             if (isIsolated()) { clearKeys(); return; }
 
-            // 判断本次加载是否由我们注入的自动刷新触发
-            var fromAuto = sessionStorage.getItem(AUTO) === '1';
-            var n = parseInt(sessionStorage.getItem(COUNT) || '0', 10);
-            sessionStorage.removeItem(AUTO); // 消费该标记
-            // 手动/全新导航与自动刷新无关：计数清零
-            if (!fromAuto) n = 0;
-            // 关键修复（无痕模式卡 0%）：本次页面加载时 SW 尚未接管（controller 为空），
-            // 说明上一步那个"自动刷新"根本没经过 SW，COOP/COEP 注入不到文档，属于无效
-            // 尝试。连点原生刷新时这类无效导航会把自动刷新预算白白耗尽，等 SW 真正接管
-            // 后预算已用完 → 引导就此停手，页面停在未隔离、引擎进度一直 0%。因此凡是
-            // 非 SW 接管的无效加载一律不计入预算，保证后续一经 SW 接管的有效刷新仍会继续
-            // 执行到隔离完成；而"引擎已在后台续传、一隔离即以已下载进度继续"由 sw.js 保证。
-            if (!navigator.serviceWorker.controller) n = 0;
+            // 判断本页文档是否【已由 Service Worker 提供】：
+            //   - true  ：本次导航已由 SW 注入 COOP/COEP，却仍未隔离 → 判定浏览器不支持 SAB。
+            //   - false ：本次文档未经 SW（首次加载/无 SW），需注册 SW 并在其接管后刷新一次。
+            // 必须用脚本顶部的同步值；不能用 claim 中途变动的 controller，否则会把"还在转向
+            // 隔离的半途状态"误判为不支持。SW 在 activate 的 waitUntil 里做了 clients.claim()，
+            // 因此 ready resolve 之后再度导航必然由 SW 提供，controller 一定在页面加载时就是 SW。
+            var controllerAtStart = navigator.serviceWorker.controller;
 
-            var reloading = false;
+            // 已由 SW 提供过（或重试耗尽）仍未隔离 → 弹窗。用户刷新后若仍不支持，同样命中这里。
+            var fromAuto = sessionStorage.getItem(AUTO) === '1';
+            if (fromAuto || controllerAtStart) {
+                sabUnsupported();
+                clearKeys();
+                return;
+            }
+
+            // 首次加载、SW 尚未接管：注册 SW，就绪（含 skipWaiting + clients.claim）后注入一次
+            // 刷新，使后续文档由 SW 提供从而携带 COOP/COEP。带次数上限兜底，防止极端环境下卡死。
+            var n = parseInt(sessionStorage.getItem(COUNT) || '0', 10);
+            if (n >= 3) { sabUnsupported(); clearKeys(); return; }
+
             function doReload() {
-                // 防止 controllerchange 与 setTimeout(ready) 并发触发重复刷新，
-                // 避免双重重载竞争导致文档尚未经 SW 注入隔离头就被中断。
-                if (reloading) { return; }
-                if (isIsolated()) { clearKeys(); return; }
-                reloading = true;
-                sessionStorage.setItem(LAST, String(Date.now()));
                 sessionStorage.setItem(AUTO, '1');
                 sessionStorage.setItem(COUNT, String(n + 1));
                 location.reload();
             }
 
-            if (navigator.serviceWorker.controller) {
-                // SW 已接管但尚未隔离。
-                if (fromAuto) {
-                    // 我们注入的刷新还没生效：受限流 + 次数上限兜底，防止无限刷新循环。
-                    if (n < MAX_AUTO) {
-                        setTimeout(function () {
-                            if (isIsolated()) { clearKeys(); return; }
-                            var now = Date.now(), last = parseInt(sessionStorage.getItem(LAST) || '0', 10);
-                            if (now - last >= MIN_MS) doReload();
-                        }, MIN_MS);
-                    } else {
-                        // 已连续自动刷新 MAX_AUTO 次仍未达成跨源隔离 → 判定该浏览器不支持 SAB，弹窗提示换浏览器。
-                        sabUnsupported();
-                    }
-                } else {
-                    // 手动刷新（用户主动行为）：立即重试一次，不受限流约束，
-                    // 否则连点刷新时隔离一直被拖住，引擎进度会卡在 0%。
-                    doReload();
-                }
-            } else {
-                // 首次加载，SW 尚未接管：等它接管后刷新，使文档进入 SW 作用域以获得 COOP/COEP。
-                navigator.serviceWorker.addEventListener('controllerchange', doReload);
+            try {
                 navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function () {
                     navigator.serviceWorker.ready.then(function () {
-                        setTimeout(doReload, 200);
-                    }).catch(function () {});
-                }).catch(function () {});
+                        if (navigator.serviceWorker.controller) { doReload(); return; }
+                        // SW 已激活但当前 client 尚未建立 controller：等接管事件，兜底定时再刷
+                        navigator.serviceWorker.addEventListener('controllerchange', doReload);
+                        setTimeout(function () { if (!isIsolated()) doReload(); }, 300);
+                    }).catch(function () { sabUnsupported(); });
+                }).catch(function () { sabUnsupported(); });
+            } catch (e) {
+                sabUnsupported();
             }
         })();
     </script>
