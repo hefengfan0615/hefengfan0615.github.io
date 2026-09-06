@@ -14365,20 +14365,9 @@ var IS = (e,t)=>{
 ;
 const su = kS({
     onNeedRefresh() {
-        _m({
-            title: "\u53D1\u73B0\u65B0\u7248\u672C",
-            message: "\u662F\u5426\u5237\u65B0\u9875\u9762\u4EE5\u66F4\u65B0\u5230\u6700\u65B0\u7248\u672C\uFF1F",
-            showCancelButton: !0,
-            confirmButtonText: "\u7ACB\u5373\u5237\u65B0",
-            cancelButtonText: "\u7A0D\u540E\u5237\u65B0"
-        }).then(()=>{
-            su(!0)
-        }
-        ).catch(()=>{
-            su(!1),
-            hE("\u65B0\u7248\u672C\u5C06\u5728\u4E0B\u6B21\u6253\u5F00\u65F6\u751F\u6548")
-        }
-        )
+        // 静默更新：不再弹窗询问用户。有网时自动跳到最新版；
+        // 离线时(理论上到不了这)仅跳过等待、保持使用原缓存，下次打开再生效。
+        navigator.onLine ? su(!0) : su(!1)
     },
     onOfflineReady() {}
 });
