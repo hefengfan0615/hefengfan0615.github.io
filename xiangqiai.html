@@ -78,6 +78,17 @@
                 sessionStorage.removeItem(LAST);
             }
 
+            // 自动检测 SAB：只有浏览器【确实无法达成跨源隔离 / 无 SharedArrayBuffer】
+            // 时才弹窗提示换浏览器。仅在隔离引导的自动刷新预算耗尽后仍未隔离才触发，
+            // 首次加载（SW 未接管、尚未隔离的过渡态）绝不会误报。全程只弹一次。
+            function sabUnsupported() {
+                var warned = false;
+                try { warned = localStorage.getItem('xiangqi-sab-warned') === '1'; } catch (e) {}
+                if (warned) { return; }
+                try { localStorage.setItem('xiangqi-sab-warned', '1'); } catch (e) {}
+                try { window.alert('您的浏览器不支持SAB技术，请换一个浏览器试试吧~'); } catch (e) {}
+            }
+
             // 已隔离：本次会话完成，清除全部遗留标记便于后续环境变化时重走引导
             if (isIsolated()) { clearKeys(); return; }
 
@@ -118,6 +129,9 @@
                             var now = Date.now(), last = parseInt(sessionStorage.getItem(LAST) || '0', 10);
                             if (now - last >= MIN_MS) doReload();
                         }, MIN_MS);
+                    } else {
+                        // 已连续自动刷新 MAX_AUTO 次仍未达成跨源隔离 → 判定该浏览器不支持 SAB，弹窗提示换浏览器。
+                        sabUnsupported();
                     }
                 } else {
                     // 手动刷新（用户主动行为）：立即重试一次，不受限流约束，
