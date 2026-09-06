@@ -363,8 +363,9 @@ async function directPassthrough(event, req, url, cache) {
 //   ready   promise —— 网络 fetch 结果确定（ok 的真假）；
 //   done    promise —— 整个下载 + 写缓存结束（无论成败）；
 //   ok     是否成功拿到网络流；
-//   loopDone  同步标记 —— 数据读取结束，此后新订阅者应改走缓存；
-//   subs    订阅者集合（{ controller }），实时扇出对象。
+//   loopDone  同步标记 —— 数据读取结束；
+//   chunks  共享字节缓冲（所有订阅者都从它【从头】读，保证每个页面拿到完整文件）；
+//   signal  唤醒信号 promise —— 有新数据 / 已结束时 resolve，供订阅者等待。
 function startDataSession(url, cache) {
     const session = {
         ready: null, resolveReady: null,
@@ -372,13 +373,15 @@ function startDataSession(url, cache) {
         ok: false,
         loopDone: false,
         expectedSize: 0,
+        chunks: [],
+        signal: null, resolveSignal: null,
         subs: new Set()
     };
     session.ready = new Promise(function (r) { session.resolveReady = r; });
     session.done = new Promise(function (r) { session.resolveDone = r; });
+    armSignal(session);
 
     (async function () {
-        let chunks = [];
         let total = 0;
         try {
             const resp = await fetch(url.href, { cache: "reload" });
@@ -399,29 +402,32 @@ function startDataSession(url, cache) {
             for (;;) {
                 const r = await reader.read();
                 if (r.done) break;
-                chunks.push(r.value);
+                session.chunks.push(r.value);
                 total += r.value.byteLength;
-                // 实时扇出：发给所有在订阅的页面（被移除/报错的订阅剔除，绝不暂停下载）
-                for (const s of session.subs) {
-                    try { s.controller.enqueue(r.value); }
-                    catch (e) { session.subs.delete(s); }
-                }
+                kickSignal(session); // 唤醒所有等待的订阅者去读新一批数据
             }
-            session.loopDone = true; // 读完：此后新订阅者走缓存
-            await writeDataCache(url.href, chunks, total, cache);
+            session.loopDone = true; // 读完：数据已完整缓冲
+            await writeDataCache(url.href, session.chunks, total, cache);
         } catch (e) {
-            // 网络中断等异常：交由下方 finally 收尾，页面订阅流会关闭并退化为读缓存
+            // 网络中断等异常：交由 finally 收尾，订阅流读到已有数据后关闭
         } finally {
-            for (const s of session.subs) {
-                try { s.controller.close(); } catch (e) {}
-            }
-            session.subs.clear();
-            dataSession = null;     // 释放，允许后续新下载
+            session.loopDone = true;
+            kickSignal(session);
             session.resolveDone();
         }
     })();
 
     return session;
+}
+
+// 挂一个新的“信号”供订阅者等待；kickSignal 会 resolve 旧信号并换新。
+function armSignal(session) {
+    session.signal = new Promise(function (r) { session.resolveSignal = r; });
+}
+function kickSignal(session) {
+    const rs = session.resolveSignal;
+    armSignal(session);
+    if (rs) rs();
 }
 
 // 把内存中已下载的整份 .data 原子写入 CacheStorage（流式入缓存，避免二次拷贝大块内存）。
@@ -452,15 +458,23 @@ async function writeDataCache(href, chunks, total, cache) {
     notifyUpdate();
 }
 
-// 订阅实时流：在 start() 中【同步】登记进会话。调用后随即必须【无 await】复查 loopDone，
-// 才能保证“订阅太晚拿 0 字节”的竞态不会发生。
+// 订阅实时流：输出流在 pull 时从 session.chunks【从头】读取。
+// 数据随下载增长→每次 signal 唤醒后继续多发；下载结束(loopDone)→发完剩余后关闭。
+// 因此无论何时刷新加入，都能拿到【从 0 到结尾的完整文件】，进度也从当前位置续走。
 function makeSubscriberStream(session) {
-    const entry = {};
-    const stream = new ReadableStream({
-        start: function (controller) { entry.controller = controller; session.subs.add(entry); },
-        cancel: function () { session.subs.delete(entry); }
+    const entry = { idx: 0 };
+    return new ReadableStream({
+        pull: function (controller) {
+            return (async function () {
+                while (entry.idx < session.chunks.length) {
+                    controller.enqueue(session.chunks[entry.idx++]);
+                }
+                if (session.loopDone) { controller.close(); return; }
+                await session.signal; // 等下一批数据或结束，再回检
+            })();
+        },
+        cancel: function () { /* 数据在共享缓冲，无需清理 */ }
     });
-    return stream;
 }
 
 async function getDataResponse(event, req, url, cache) {
@@ -482,20 +496,10 @@ async function getDataResponse(event, req, url, cache) {
         return withIsolationHeaders(await directPassthrough(event, req, url, cache));
     }
 
-    // 4) 订阅实时流：start() 已同步登记进 session.subs。
-    const stream = makeSubscriberStream(session);
-    if (session.loopDone) {
-        // 登记那一刻下载恰好已读完：此订阅拿不到数据 → 退订，等缓存落盘后从缓存出波
-        stream.cancel().catch(function () {});
-        await session.done;
-        const c = await cache.match(url.href);
-        if (c) return withIsolationHeaders(c);
-        return withIsolationHeaders(await directPassthrough(event, req, url, cache));
-    }
-
+    // 4) 订阅实时流：输出流按需从共享缓冲【从头】读，下载完成即发满并关闭。
     const headers = { "Content-Type": "application/octet-stream" };
     if (session.expectedSize > 0) headers["Content-Length"] = String(session.expectedSize);
-    return withIsolationHeaders(new Response(stream, {
+    return withIsolationHeaders(new Response(makeSubscriberStream(session), {
         status: 200,
         statusText: "OK",
         headers: headers
