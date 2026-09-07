@@ -21,10 +21,17 @@
 
 "use strict";
 
-const CACHE_NAME = "fengfan-xiangqi-files-v2";
+const CACHE_NAME = "fengfan-xiangqi-files-v2"; // 保留 v2：旧未版本化 .data 可被“沿用迁移”采纳，避免重下
 const MANIFEST_PATH = "/version.json";
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
+// 版本化缓存键：把 .data 和引擎二进制绑到同一个 engineVersion，杜绝“新引擎 + 旧 NNUE”错配。
+//   - 缓存/校验/存储全部用“版本号”作键；引擎版本一变，键就变 → 必然重新下载对齐版本。
+//   - 下载本身仍走真实路径 DATA_PATH（query 不影响响应字节）。
+const DATA_PFX = DATA_PATH + "?v=";
+const DATA_META_PFX = "/__meta/pikafish.data."; // 版本化 meta 前缀
+function dataCacheKey(version) { return (version ? DATA_PFX + encodeURIComponent(version) : DATA_PATH); }
+function dataMetaKey(version)   { return (version ? DATA_META_PFX + encodeURIComponent(version) + ".sha256" : DATA_META_KEY); }
 
 // 前端界面外壳：小体积，安装时预缓存，保证离线首屏
 const APP_SHELL = [
@@ -218,22 +225,22 @@ async function cacheFirstEngine(event, req, url, cache) {
 //   写缓存这路并行完成。worker 中断/刷新不影响本路，也不会悬挂（区别于用手工
 //   tee/自建 SW 内存流去"多播"，后者在刷新中断后会产生永久悬挂的流）。
 // ----------------------------------------------------------------------------
-async function backgroundCacheData(resp, cache, url) {
+async function backgroundCacheData(resp, storeHref, fetchPath, metaKey, cache) {
     try {
         const buf = await resp.arrayBuffer(); // 读取整份（实时网络下载）
         const headers = new Headers(resp.headers);
         headers.delete("Content-Encoding"); // body 已是解压后的原始字节
         headers.delete("Content-Length");
         headers.delete("Set-Cookie");
-        await cache.put(url.href, new Response(buf, {
+        await cache.put(storeHref, new Response(buf, {
             status: resp.status || 200,
             statusText: resp.statusText || "OK",
             headers: headers
         }));
-        // 大文件 data 额外记录 sha256 到 meta，供下次秒级校验命中缓存。
-        if (url.pathname === DATA_PATH) {
+        // 大文件 data 额外记录 sha256 到 meta（版本化键），供下次秒级校验命中缓存。
+        if (fetchPath === DATA_PATH) {
             const sha = await sha256Hex(new Uint8Array(buf));
-            await cache.put(DATA_META_KEY, new Response(sha, {
+            await cache.put(metaKey, new Response(sha, {
                 headers: { "Content-Type": "text/plain" }
             })).catch(function () {});
         }
@@ -304,9 +311,9 @@ async function loadManifest(cache) {
     return null;
 }
 
-async function readStoredSha(cache) {
+async function readStoredSha(cache, metaKey) {
     try {
-        const r = await cache.match(DATA_META_KEY);
+        const r = await cache.match(metaKey);
         if (r) return (await r.text()).trim();
     } catch (e) { /* 忽略 */ }
     return null;
@@ -325,26 +332,28 @@ async function readStoredSha(cache) {
 // ============================================================================
 let dataSession = null;
 
-// 尝试从缓存提供 .data：命中且与最新清单哈希一致 → 返回 Response；否则返回 null。
-async function tryServeDataFromCache(req, url, cache) {
-    const cached = await cache.match(req);
+// 尝试提供 .data 缓存。storeHref/metaKey 是“当前引擎版本”对应的键：
+//   命中该版本的缓存且 sha 与最新清单一致 → 返回；否则返回 null。
+// 校验用的期望哈希始终对应该版本的清单项 /wasm/pikafish.data。
+async function tryServeDataFromCache(storeHref, metaKey, fetchPath, cache) {
+    const cached = await cache.match(storeHref);
     if (!cached) return null;
     try {
         const manifest = await getManifest(cache); // 最新清单（缓存击穿）
-        const expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
+        const expected = manifest ? manifestSha(manifest, fetchPath) : undefined;
         if (expected) {
-            let stored = await readStoredSha(cache);
+            let stored = await readStoredSha(cache, metaKey);
             if (stored === null) {
                 // 旧版本缓存没有 meta：一次性全量哈希补写，避免盲目重下 51MB
                 stored = await sha256Hex(await readAllBytes(cached.clone().body));
                 if (stored) {
-                    await cache.put(DATA_META_KEY, new Response(stored, {
+                    await cache.put(metaKey, new Response(stored, {
                         headers: { "Content-Type": "text/plain" }
                     })).catch(function () {});
                 }
             }
             if (stored === expected) return cached;          // 已最新：秒用
-            await cache.delete(req).catch(function () {});   // 过期：删掉走回源
+            await cache.delete(storeHref).catch(function () {});   // 过期：删掉走回源
             return null;
         }
         return cached; // 拿不到清单：用缓存兜底
@@ -353,19 +362,52 @@ async function tryServeDataFromCache(req, url, cache) {
     }
 }
 
-// 网络直通兜底（下载会话失败 / 极端竞态时用）：直接流式给 worker，后台并行写缓存。
-async function directPassthrough(event, req, url, cache) {
+// 把“已验证匹配”的响应沿用到当前版本键（用于把旧版未版本化缓存迁移过来，避免重下 51MB）。
+async function adoptCachedData(legacy, storeHref, metaKey, cache) {
     try {
-        const resp = await fetch(req, { cache: "reload" });
+        const buf = await legacy.clone().arrayBuffer();
+        await cache.put(storeHref, legacy.clone()).catch(function () {});
+        const sha = await sha256Hex(new Uint8Array(buf));
+        await cache.put(metaKey, new Response(sha, {
+            headers: { "Content-Type": "text/plain" }
+        })).catch(function () {});
+        return legacy;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 清理不属于当前引擎版本的 .data 及其 meta（含旧版未版本化键），避免无界堆积。
+async function pruneOldData(storeHref, metaKey, cache) {
+    try {
+        const keys = await cache.keys();
+        await Promise.all(keys.map(async function (r) {
+            const k = r.url;
+            let isDataEntry = false;
+            if (k.indexOf(DATA_PATH + "?") === 0) isDataEntry = true;                 // 版本化 data
+            else if (k === DATA_PATH) isDataEntry = true;                             // 旧裸 data
+            else if (k.lastIndexOf(DATA_META_PFX, 0) === 0) isDataEntry = true;       // 版本化 meta
+            else if (k === DATA_META_KEY) isDataEntry = true;                         // 旧 meta
+            if (isDataEntry && k !== storeHref && k !== metaKey) {
+                await cache.delete(k).catch(function () {});
+            }
+        }));
+    } catch (e) { /* 清理失败不影响主流程 */ }
+}
+
+// 网络直通兜底（下载会话失败 / 极端竞态时用）：直接流式给 worker，后台并行写缓存。
+async function directPassthrough(event, req, fetchPath, storeHref, metaKey, cache) {
+    try {
+        const resp = await fetch(fetchPath, { cache: "reload" });
         if (!resp.ok || resp.type !== "basic") {
-            const fb = await cache.match(req);
+            const fb = await cache.match(storeHref);
             if (fb) return fb;
             return resp;
         }
-        event.waitUntil(backgroundCacheData(resp.clone(), cache, url).catch(function () {}));
+        event.waitUntil(backgroundCacheData(resp.clone(), storeHref, fetchPath, metaKey, cache).catch(function () {}));
         return resp;
     } catch (e) {
-        const fb = await cache.match(req);
+        const fb = await cache.match(storeHref);
         if (fb) return fb;
         return new Response(null, { status: 504, statusText: "Network Unavailable" });
     }
@@ -379,7 +421,7 @@ async function directPassthrough(event, req, url, cache) {
 //   loopDone  同步标记 —— 数据读取结束；
 //   chunks  共享字节缓冲（所有订阅者都从它【从头】读，保证每个页面拿到完整文件）；
 //   signal  唤醒信号 promise —— 有新数据 / 已结束时 resolve，供订阅者等待。
-function startDataSession(url, cache) {
+function startDataSession(fetchPath, storeHref, metaKey, cache) {
     const session = {
         ready: null, resolveReady: null,
         done: null, resolveDone: null,
@@ -389,7 +431,9 @@ function startDataSession(url, cache) {
         expectedSize: 0,
         chunks: [],
         signal: null, resolveSignal: null,
-        subs: new Set()
+        subs: new Set(),
+        storeHref: storeHref,
+        metaKey: metaKey
     };
     session.ready = new Promise(function (r) { session.resolveReady = r; });
     session.done = new Promise(function (r) { session.resolveDone = r; });
@@ -398,7 +442,7 @@ function startDataSession(url, cache) {
     (async function () {
         let total = 0;
         try {
-            const resp = await fetch(url.href, { cache: "reload" });
+            const resp = await fetch(fetchPath, { cache: "reload" });
             if (!(resp && resp.ok && resp.type === "basic")) {
                 session.resolveReady(); // ok=false，走兜底
                 return;
@@ -407,7 +451,7 @@ function startDataSession(url, cache) {
             // 用清单里的 size 作为 Content-Length 基线（保证进度百分比正确）
             try {
                 const m = await getManifest(cache);
-                const e = m && m.files && m.files[url.pathname];
+                const e = m && m.files && m.files[fetchPath];
                 session.expectedSize = (e && e.size) || 0;
             } catch (err) {}
             session.resolveReady(); // 网络已通，订阅者可开始收数据
@@ -425,7 +469,7 @@ function startDataSession(url, cache) {
             // 绝不把截断的文件交给引擎（避免读取 NNUE 越界 → memory access out of bounds）。
             if (reachedEOF && (session.expectedSize === 0 || total >= session.expectedSize)) {
                 session.completed = true;
-                await writeDataCache(url.href, session.chunks, total, cache);
+                await writeDataCache(storeHref, session.chunks, total, metaKey, cache);
             }
         } catch (e) {
             // 网络中断等异常：交由 finally 收尾，订阅流读到已有数据后关闭
@@ -451,7 +495,8 @@ function kickSignal(session) {
 }
 
 // 把内存中已下载的整份 .data 原子写入 CacheStorage（流式入缓存，避免二次拷贝大块内存）。
-async function writeDataCache(href, chunks, total, cache) {
+// 写入用“当前引擎版本”对应的键 storeHref / metaKey。
+async function writeDataCache(storeHref, chunks, total, metaKey, cache) {
     let i = 0;
     const body = new ReadableStream({
         pull: function (c) {
@@ -464,14 +509,14 @@ async function writeDataCache(href, chunks, total, cache) {
         statusText: "OK",
         headers: { "Content-Type": "application/octet-stream", "Content-Length": String(total) }
     });
-    await cache.put(href, resp).catch(function () {});
+    await cache.put(storeHref, resp).catch(function () {});
     // meta 仅用于下次秒级校验命中缓存
     try {
         const full = new Uint8Array(total);
         let off = 0;
         for (const c of chunks) { full.set(c, off); off += c.byteLength; }
         const sha = await sha256Hex(full);
-        await cache.put(DATA_META_KEY, new Response(sha, {
+        await cache.put(metaKey, new Response(sha, {
             headers: { "Content-Type": "text/plain" }
         })).catch(function () {});
     } catch (e) { /* 忽略，下次命中不了就重下 */ }
@@ -502,22 +547,42 @@ function makeSubscriberStream(session) {
 }
 
 async function getDataResponse(event, req, url, cache) {
-    // 1) 缓存命中且最新 → 秒用，绝不重下
-    const fromCache = await tryServeDataFromCache(req, url, cache);
-    if (fromCache) return withIsolationHeaders(fromCache);
+    // 解析当前引擎版本，构造与该版本绑定的缓存键（.data ↔ 引擎同版本，杜绝新旧错配）。
+    // 即使离线，getManifest 也会回退到缓存的清单，engineVersion 依然可得。
+    let version = null;
+    try {
+        const manifest = await getManifest(cache);
+        if (manifest && typeof manifest.engineVersion === "string") version = manifest.engineVersion;
+    } catch (e) { /* 拿不到版本则以未版本化键兜底 */ }
+
+    const storeHref = dataCacheKey(version);   // 当前版本缓存键
+    const metaKey   = dataMetaKey(version);    // 当前版本 meta 键
+    const fetchPath = url.pathname;            // 下载始终走真实路径（query 不影响字节）
+
+    // 1) 命中当前版本缓存且哈希一致 → 秒用，绝不重下
+    let fromCache = await tryServeDataFromCache(storeHref, metaKey, fetchPath, cache);
+    if (!fromCache) {
+        // 1.5) 旧版未版本化缓存：若其哈希仍与当前清单一致，直接沿用（避免重下 51MB）
+        const legacy = await tryServeDataFromCache(DATA_PATH, DATA_META_KEY, fetchPath, cache);
+        if (legacy) fromCache = await adoptCachedData(legacy, storeHref, metaKey, cache);
+    }
+    if (fromCache) {
+        await pruneOldData(storeHref, metaKey, cache).catch(function () {});
+        return withIsolationHeaders(fromCache);
+    }
 
     // 2) 需要下载：原子共享唯一会话（同步构建，杜绝并发各自回源）；并钉住它的生命周期，
     //    用 event.waitUntil 保证刷新期间 SW 不提前终止、下载不断。
-    if (!dataSession) dataSession = startDataSession(url, cache);
+    if (!dataSession) dataSession = startDataSession(fetchPath, storeHref, metaKey, cache);
     const session = dataSession;
     event.waitUntil(session.done);
 
     // 3) 等网络结果确定：成功可订阅；失败则走缓存 / 网络直通兜底
     await session.ready;
     if (!session.ok) {
-        const fb = await cache.match(url.href);
+        const fb = await cache.match(storeHref);
         if (fb) return withIsolationHeaders(fb);
-        return withIsolationHeaders(await directPassthrough(event, req, url, cache));
+        return withIsolationHeaders(await directPassthrough(event, req, fetchPath, storeHref, metaKey, cache));
     }
 
     // 4) 订阅实时流：输出流按需从共享缓冲【从头】读，下载完成即发满并关闭。
