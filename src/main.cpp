@@ -78,8 +78,8 @@ __attribute__((used))  // keep main alive
 int main(int argc, char* argv[]) {
     // In WASM builds main() ignores its args (the page drives the engine via
     // wasm_uci_execute()); cast them away so there is no unused-parameter warning.
-    (void)argc;
-    (void)argv;
+    (void) argc;
+    (void) argv;
 
     std::cout << engine_info() << std::endl;
 
