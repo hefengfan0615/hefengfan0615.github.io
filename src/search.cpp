@@ -146,12 +146,12 @@ bool is_shuffling(Move move, Stack* const ss, const Position& pos) {
 
 }  // namespace
 
-Search::Worker::Worker(SharedState&                    sharedState,
-                       std::unique_ptr<ISearchManager> sm,
-                       usize                           threadId,
-                       usize                           numaThreadId,
-                       usize                           numaTotalThreads,
-                       NumaReplicatedAccessToken       token) :
+Search::Worker::Worker(SharedState&                   sharedState,
+                       std::unique_ptr<SearchManager> sm,
+                       usize                          threadId,
+                       usize                          numaThreadId,
+                       usize                          numaTotalThreads,
+                       NumaReplicatedAccessToken      token) :
     // Unpack the SharedState struct into member variables
     sharedHistory(sharedState.sharedHistories.at(token.get_numa_index())),
     continuationHistory(sharedHistory.continuationHistory()),
@@ -770,9 +770,10 @@ Value Search::Worker::search(
     Square prevSq  = ((ss - 1)->currentMove).is_ok() ? ((ss - 1)->currentMove).to_sq() : SQ_NONE;
     bestMove       = Move::none();
     priorReduction = (ss - 1)->reduction;
-    (ss - 1)->reduction = 0;
-    ss->statScore       = 0;
-    (ss + 2)->cutoffCnt = 0;
+    (ss - 1)->reduction        = 0;
+    ss->statScore              = 0;
+    (ss + 2)->cutoffCnt        = 0;
+    (ss + 1)->priorNMPFailHigh = 0;
 
     const auto correctionValue = correction_value(*this, pos, ss);
 
@@ -846,7 +847,7 @@ Value Search::Worker::search(
         {
             // Bonus for a quiet ttMove that fails high
             if (!ttCapture)
-                update_quiet_histories(pos, ss, *this, ttData.move, std::min(109 * depth, 1785));
+                update_quiet_histories(pos, ss, *this, ttData.move, 127 * depth);
 
             // Extra penalty for early quiet moves of the previous ply
             if (prevSq != SQ_NONE && (ss - 1)->moveCount < 3 && !priorCapture)
@@ -898,7 +899,7 @@ Value Search::Worker::search(
 
     // Step 8. Razoring
     // If eval is really low, skip search entirely and return the qsearch value
-    if (!PvNode && eval < alpha - 720 * depth * depth)
+    if (!PvNode && eval < alpha - 720 * depth && !seekMate)
         return qsearch<NonPV>(pos, ss, alpha, beta);
 
     // Step 9. Futility pruning: child node
@@ -918,8 +919,9 @@ Value Search::Worker::search(
     }
 
     // Step 10. Null move search with verification search
-    if (cutNode && ss->staticEval >= beta - 8 * depth - 51 * improving + 188 && !excludedMove
-        && pos.major_material(us) && ss->ply >= nmpMinPly && beta >= -2000)
+    if (cutNode
+        && ss->staticEval + 50 * ss->priorNMPFailHigh >= beta - 8 * depth - 51 * improving + 188
+        && !excludedMove && pos.major_material(us) && ss->ply >= nmpMinPly && beta >= -2000)
     {
         assert((ss - 1)->currentMove != Move::null());
 
@@ -935,7 +937,10 @@ Value Search::Worker::search(
         if (nullValue >= beta && !is_win(nullValue))
         {
             if (nmpMinPly || depth < 15)
+            {
+                ++ss->priorNMPFailHigh;
                 return nullValue;
+            }
 
             // Recursive verification is not allowed
             assert(!nmpMinPly);
@@ -949,7 +954,10 @@ Value Search::Worker::search(
             nmpMinPly = 0;
 
             if (v >= beta)
+            {
+                ++ss->priorNMPFailHigh;
                 return nullValue;
+            }
         }
     }
 
