@@ -573,7 +573,14 @@ async function getDataResponse(event, req, url, cache) {
 
     // 2) 需要下载：原子共享唯一会话（同步构建，杜绝并发各自回源）；并钉住它的生命周期，
     //    用 event.waitUntil 保证刷新期间 SW 不提前终止、下载不断。
-    if (!dataSession) dataSession = startDataSession(fetchPath, storeHref, metaKey, cache);
+    //   ⚠️ 会话必须与当前引擎版本绑定：dataSession 是 SW 全局单例，若上一会话属于
+    //      别的版本（旧版本下载中、或完成后仍驻留内存），直接复用会把旧版本的 NNUE
+    //      字节流喂给当前打开的新版本引擎 —— 这正是“第一次打开只更新引擎、NNUE 仍是
+    //      旧的，需手动刷新才重下”的根因。只要请求的 storeHref 与现会话不一致，就为
+    //      当前版本开启新会话，保证引擎与 NNUE 在同一次打开内配套更新。
+    if (!dataSession || dataSession.storeHref !== storeHref) {
+        dataSession = startDataSession(fetchPath, storeHref, metaKey, cache);
+    }
     const session = dataSession;
     event.waitUntil(session.done);
 
