@@ -1,5 +1,5 @@
 {
-  "engineVersion": "39264c4",
+  "engineVersion": "b633f51",
   "files": {
     "/assets/ChessBoard.46291e70.js": {
       "sha256": "f832ef8254f774a7af3214842f28ba1755cc358cf2c4bd72050aeab33f75ef34",
@@ -58,13 +58,13 @@
       "size": 84362
     },
     "/wasm/pikafish.wasm": {
-      "sha256": "fc9336bd122904177cf0bbb658f7c1654fbb06907ac9222c3f0b242d5b1469c3",
-      "size": 721924
+      "sha256": "18dbf639a6bffdd56d7c9edfd91e4572c8627485b436243c9b6e99536fdd025e",
+      "size": 721980
     },
     "/xiangqiai.html": {
       "sha256": "775d3d625997ff8569a22e26f748ba1bdfb2190d8f8dce0374d35f9c953f86ce",
       "size": 20916
     }
   },
-  "updatedAt": "2026-09-13T00:26:47Z"
+  "updatedAt": "2026-09-17T22:54:17+08:00"
 }
