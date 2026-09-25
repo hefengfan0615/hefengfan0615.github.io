@@ -916,7 +916,7 @@ ifeq ($(arch),wasm32)
 	endif
 	LDFLAGS += \
 		-flto \
-		-sINITIAL_MEMORY=128MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=3MB \
+		-sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=3MB \
 		--pre-js emscripten/preamble.js \
 		--preload-file pikafish.nnue@pikafish.nnue \
 		-s ENVIRONMENT=web,worker,node \
