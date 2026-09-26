@@ -224,7 +224,7 @@
             }
 
             try {
-                navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function () {
+                navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).then(function () {
                     armWatchdog(); // register 已推进，重置计时（装 SW 过程也算进度）
                     navigator.serviceWorker.ready.then(function () {
                         if (settled) { return; }
@@ -372,7 +372,7 @@
                 setTimeout(doReload, 4000); // 兜底：controllerchange 未触发也能刷新
             }
 
-            navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function (reg) {
+            navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).then(function (reg) {
                 var n = parseInt(sessionStorage.getItem(KEY) || '0', 10);
                 if (n >= MAX) { return; }
 

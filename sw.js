@@ -21,7 +21,8 @@
 
 "use strict";
 
-const CACHE_NAME = "fengfan-xiangqi-files-v2"; // 保留 v2：旧未版本化 .data 可被“沿用迁移”采纳，避免重下
+const CACHE_NAME = "fengfan-xiangqi-files-v3"; // bump 到 v3：整体淘汰一次旧缓存，避免被旧 SW 缓存一直卡在旧版
+// 注：旧未版本化 .data 的"沿用迁移"逻辑（dataCacheKey/DATA_PATH 裸键）仍兼容，不会因换版本号而重下 51MB。
 const MANIFEST_PATH = "/version.json";
 const DATA_PATH = "/wasm/pikafish.data";
 const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
@@ -54,8 +55,12 @@ self.addEventListener("install", function (event) {
     event.waitUntil(
         (async function () {
             const cache = await caches.open(CACHE_NAME);
+            // 预缓存前端外壳：逐条网络优先回源（cache.add 走真实网络，不经 SW 自身 fetch 处理），
+            // 任何单条失败都不阻塞 skipWaiting。确保新 SW 一接管就把"最新"HTML/资源写入壳缓存。
             await Promise.allSettled(
-                APP_SHELL.map(function (u) { return cache.add(u); })
+                APP_SHELL.map(function (u) {
+                    return cache.add(u).catch(function () { /* 单资源失败不影响其余与接管 */ });
+                })
             );
             await self.skipWaiting();
         })()
