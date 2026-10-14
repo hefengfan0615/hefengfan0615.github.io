@@ -1,40 +1,58 @@
 // ============================================================================
-// Fengfan Xiangqi Service Worker
+// Fengfan Xiangqi Service Worker  —  最终版
 //
 // 缓存策略：引擎 / 前端界面 分层缓存 + Cache First + stale-while-revalidate
 //
-//  [1] 前端界面资源：Cache First + SWR。
+//  [1] 前端界面资源：Cache First + SWR + 清单 sha256 校验（有网必取最新）。
 //  [2] 引擎代码 pikafish.js / pikafish.wasm（小文件）：【网络优先】——
-//      在线时每次回源拿最新字节，保证"刷新即用最新引擎"，彻底规避
-//      清单/CDN/缓存滞后导致一直用旧引擎的问题；离线时回退缓存兜底。
+//      在线时每次回源拿最新字节，保证"刷新即用最新引擎"；离线回退缓存兜底。
 //  [3] 引擎大文件 pikafish.data（~50MB）：Cache First + 清单哈希校验。
-//      data 是确定性产物，只有 NNUE 真的变了才回源重下 51MB，否则秒用缓存。
-//      version.json 始终"缓存击穿"（时间戳 query + cache:reload）后比对，
-//      确保用的是服务器最新清单，不受 CDN 滞后影响。
-//  [4] 引擎大文件需要回源下载时：用【浏览器管理的网络 passthrough】直接把字节
-//      流式给引擎 worker，进度实时可见；后台并行把整份写入缓存供下次秒开。
-//      不再用 SW 内存自建 ReadableStream 流式转发整份 50MB —— 那种"SW 源头流"
-//      在页面刷新/中断后可能被 Chromium 永久悬挂（reader.read() 永不返回也不报错，
-//      进度一直 0%，只能清浏览数据恢复），是"刷新多次后卡 0"的根因。
-//  [5] 所有响应统一注入 COOP/COEP，保证多线程 WASM（SharedArrayBuffer）可用。
+//      version.json 始终"缓存击穿"后比对，NNUE 没变就秒用缓存，变了才回源。
+//  [4] 大文件下载：单实例下载会话 + 实时扇出，刷新/切后台都不丢进度，
+//      绝不产生"SW 源头流"式的悬挂（进度一直 0 的元凶）。
+//  [5] 统一注入 COOP/COEP，保证多线程 WASM（SharedArrayBuffer）可用。
+//
+//  ★ 本版修复清单：
+//    A. NNUE 更新后刷新无效
+//       → tryServeDataFromCache 判定磁盘缓存过期并删除时，必须同时清空
+//         内存中与之绑定的 dataSession（否则 chunks 里的旧 NNUE 字节会被
+//         getDataResponse 复用重放给引擎）。仅清"当前版本键"对应的会话。
+//    B. pruneOldData 形同虚设
+//       → 原实现用 pathname 前缀/全等判断，而 cache.keys() 返回完整 URL，
+//         条件恒为 false，旧 .data 会无限堆积。改用 URL 解析后的 pathname。
+//    C. pruneOldData 调用位置
+//       → 原只在"缓存命中"分支调用，导致"发布后第一次打开直接下载新版本"
+//         这条路径不清旧缓存，旧 51MB 会滞留到下一次命中才清。
+//         改为在解析出版本键后、命中/下载分流之前统一调用一次（并保证
+//         旧裸键迁移 adopt 已完成，避免误删刚 adopt 的数据）。
+//    D. 缓存键污染（潜在隐患）
+//       → 前端资源和 WASM/JS 的缓存键统一规范化为 "origin + pathname"，
+//         避免将来给请求带 ?v= / utm_* / 时间戳时产生多个孤儿条目、命中失败。
+//         （.data 的版本化键保留 query，这是"版本对齐"的设计本身要求。）
+//    E. manifest 短时高频回源
+//       → 增加 1 秒 TTL，减少同一次页面加载内多次资源请求各触发一次
+//         version.json 回源；超过 1 秒仍会回源，保证"刷新即最新"。
+//    F. CLEAR_CACHE 与内存会话竞争
+//       → 清空缓存时同步清空 dataSession，避免正在进行的下载完成后把数据
+//         重新写回缓存，让"清空"看起来不生效。
 // ============================================================================
 
 "use strict";
 
-const CACHE_NAME = "fengfan-xiangqi-files-v3"; // bump 到 v3：整体淘汰一次旧缓存，避免被旧 SW 缓存一直卡在旧版
-// 注：旧未版本化 .data 的"沿用迁移"逻辑（dataCacheKey/DATA_PATH 裸键）仍兼容，不会因换版本号而重下 51MB。
+// ----------------------------------------------------------------------------
+// 常量与辅助
+// ----------------------------------------------------------------------------
+const CACHE_NAME = "fengfan-xiangqi-files-v4"; // v4：一次性淘汰旧缓存 + 应用本版修复
 const MANIFEST_PATH = "/version.json";
 const DATA_PATH = "/wasm/pikafish.data";
-const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 data 的 sha256，非真实文件
-// 版本化缓存键：把 .data 和引擎二进制绑到同一个 engineVersion，杜绝“新引擎 + 旧 NNUE”错配。
-//   - 缓存/校验/存储全部用“版本号”作键；引擎版本一变，键就变 → 必然重新下载对齐版本。
-//   - 下载本身仍走真实路径 DATA_PATH（query 不影响响应字节）。
+const DATA_META_KEY = "/__meta/pikafish.data.sha256"; // 仅内部记录 sha256，非真实文件
+// 版本化缓存键：把 .data 和 engineVersion 绑到一起，杜绝"新引擎 + 旧 NNUE"错配。
 const DATA_PFX = DATA_PATH + "?v=";
-const DATA_META_PFX = "/__meta/pikafish.data."; // 版本化 meta 前缀
-function dataCacheKey(version) { return (version ? DATA_PFX + encodeURIComponent(version) : DATA_PATH); }
-function dataMetaKey(version)   { return (version ? DATA_META_PFX + encodeURIComponent(version) + ".sha256" : DATA_META_KEY); }
+const DATA_META_PFX = "/__meta/pikafish.data.";
+function dataCacheKey(version) { return version ? DATA_PFX + encodeURIComponent(version) : DATA_PATH; }
+function dataMetaKey(version)   { return version ? DATA_META_PFX + encodeURIComponent(version) + ".sha256" : DATA_META_KEY; }
 
-// 前端界面外壳：小体积，安装时预缓存，保证离线首屏
+// 前端界面外壳：安装时预缓存，保证离线首屏
 const APP_SHELL = [
     "/xiangqiai.html",
     "/assets/index.b58f0dd0.js",
@@ -48,18 +66,32 @@ function isEngineFile(urlPath) {
            urlPath.indexOf("/wasm/pikafish.data") >= 0;
 }
 
+// 缓存键规范化：前端资源 / WASM / JS 的缓存键一律使用 origin + pathname，
+// 剔除 query 与 hash，避免将来带 ?v= / utm_* / 时间戳时产生多个孤儿条目。
+// 注意：.data 的"版本化键"必须保留 query（那是版本对齐的设计本身），
+//       所以本函数只用于"非版本化"的缓存键。
+function normalizeCacheKey(url) {
+    return new Request(url.origin + url.pathname);
+}
+
 // ----------------------------------------------------------------------------
-// 安装：预缓存前端外壳并立即 skipWaiting，尽快接管页面。
+// 状态
+// ----------------------------------------------------------------------------
+let manifestInflight = null;                                   // 并发合并用
+let manifestCached = { value: null, at: 0 };                   // 短 TTL 缓存
+const MANIFEST_TTL = 1000;                                     // 1 秒
+let dataSession = null;                                        // 大文件唯一会话
+
+// ----------------------------------------------------------------------------
+// 安装：预缓存前端外壳并立即 skipWaiting。
 // ----------------------------------------------------------------------------
 self.addEventListener("install", function (event) {
     event.waitUntil(
         (async function () {
             const cache = await caches.open(CACHE_NAME);
-            // 预缓存前端外壳：逐条网络优先回源（cache.add 走真实网络，不经 SW 自身 fetch 处理），
-            // 任何单条失败都不阻塞 skipWaiting。确保新 SW 一接管就把"最新"HTML/资源写入壳缓存。
             await Promise.allSettled(
                 APP_SHELL.map(function (u) {
-                    return cache.add(u).catch(function () { /* 单资源失败不影响其余与接管 */ });
+                    return cache.add(u).catch(function () { /* 单资源失败不阻塞接管 */ });
                 })
             );
             await self.skipWaiting();
@@ -68,7 +100,7 @@ self.addEventListener("install", function (event) {
 });
 
 // ----------------------------------------------------------------------------
-// 激活：清理旧结构缓存并立即接管页面。
+// 激活：清理旧缓存并立即接管页面。
 // ----------------------------------------------------------------------------
 self.addEventListener("activate", function (event) {
     event.waitUntil(
@@ -84,7 +116,7 @@ self.addEventListener("activate", function (event) {
 });
 
 // ----------------------------------------------------------------------------
-// 通知所有打开页面：缓存内容有更新（页面侧无监听，纯提示）。
+// 通知页面：缓存内容有更新。
 // ----------------------------------------------------------------------------
 function notifyUpdate() {
     self.clients.matchAll({ type: "window" }).then(function (list) {
@@ -93,49 +125,45 @@ function notifyUpdate() {
 }
 
 // ----------------------------------------------------------------------------
-// 抓取：仅拦截同源 GET 请求。
+// 抓取：仅拦截同源 GET。
 // ----------------------------------------------------------------------------
 self.addEventListener("fetch", function (event) {
     const req = event.request;
     if (req.method !== "GET") return;
     const url = new URL(req.url);
     if (url.origin !== self.location.origin) return;
-
     event.respondWith(serve(event, req, url));
 });
 
 // ----------------------------------------------------------------------------
-// 核心分流：清单 / 导航走网络优先；引擎文件走流式 + 续传；前端资源走 SWR。
+// 分流
 // ----------------------------------------------------------------------------
 async function serve(event, req, url) {
     const cache = await caches.open(CACHE_NAME);
 
-    // version.json 自身：必须拿到最新清单（已内联引擎版本 / 更新时间 / 文件大小）。
-    if (url.pathname === MANIFEST_PATH) return networkFirst(req, cache);
+    // version.json 自身：必须拿到最新清单。
+    if (url.pathname === MANIFEST_PATH) return networkFirst(req, url, cache);
 
-    // 导航请求（HTML 文档）：网络优先，保证界面每次都是最新，并第一时间注入
-    // COOP/COEP 建立跨源隔离（无痕模式卡 0% 的修复就靠这条快速通道）。
-    if (req.mode === "navigate") return networkFirst(req, cache);
+    // 导航请求：网络优先，尽早注入 COOP/COEP（无痕模式卡 0% 的修复）。
+    if (req.mode === "navigate") return networkFirst(req, url, cache);
 
-    // 引擎文件：Cache First + 流式下载 + 续传。
+    // 引擎文件。
     if (isEngineFile(url.pathname)) return cacheFirstEngine(event, req, url, cache);
 
-    // 前端界面资源：有网就同步哈希校验并回源取最新，离线回退原缓存。
+    // 前端界面资源。
     return serveAppAsset(req, url, cache);
 }
 
 // ----------------------------------------------------------------------------
-// 前端界面资源：网络优先 + 哈希校验（有网必取最新，离线回退原缓存）。
-//   与旧的 "Cache First + SWR"(先回旧缓存、后台再刷)不同：这里先取最新清单
-//   比对 sha256，缓存过期/缺失时【同步】回源，确保"下次打开、有网"一定拿到
-//   最新版本；内容未变的文件直接命中缓存，不浪费流量。离线时清单/回源失败 → 用缓存兜底。
+// 前端界面资源：网络优先 + 清单 sha256 校验（有网必取最新，离线回退原缓存）。
 // ----------------------------------------------------------------------------
 async function serveAppAsset(req, url, cache) {
-    const cached = await cache.match(req);
+    const cacheKey = normalizeCacheKey(url);      // ★ D：规范化缓存键
+    const cached = await cache.match(cacheKey);
 
     let expected;
     try {
-        const manifest = await getManifest(cache); // 网络优先拿最新清单，失败回退缓存
+        const manifest = await getManifest(cache);
         expected = manifest ? manifestSha(manifest, url.pathname) : undefined;
     } catch (e) { expected = undefined; }
 
@@ -144,25 +172,24 @@ async function serveAppAsset(req, url, cache) {
             const hash = await sha256Hex(await readAllBytes(cached.clone().body));
             if (hash === expected) return withIsolationHeaders(cached); // 已最新，秒用
         }
-        // 缓存缺失或过期：同步回源拿最新，本次加载即生效
+        // 缓存缺失或过期：同步回源拿最新，本次加载即生效。
         try {
             const fresh = await fetch(req, { cache: "reload" });
             if (fresh && fresh.ok && fresh.type === "basic") {
-                await cache.put(req, fresh.clone()).catch(function () {});
+                await cache.put(cacheKey, fresh.clone()).catch(function () {});
                 if (cached) notifyUpdate();
                 return withIsolationHeaders(fresh);
             }
-        } catch (e) { /* 回源失败(离线)：下面用缓存兜底 */ }
+        } catch (e) { /* 离线：下面用缓存兜底 */ }
     }
 
-    // 有缓存：直接返回（短暂取不到清单 / 回源失败时用原缓存）
     if (cached) return withIsolationHeaders(cached);
 
-    // 无缓存：再尽力直接回源一次（可能清单未取到但网络是可用的）
+    // 无缓存：再尽力直接回源一次。
     try {
         const fresh = await fetch(req, { cache: "reload" });
         if (fresh && fresh.ok && fresh.type === "basic") {
-            await cache.put(req, fresh.clone()).catch(function () {});
+            await cache.put(cacheKey, fresh.clone()).catch(function () {});
             return withIsolationHeaders(fresh);
         }
         return withIsolationHeaders(fresh);
@@ -173,27 +200,19 @@ async function serveAppAsset(req, url, cache) {
 
 // ----------------------------------------------------------------------------
 // 引擎文件：
-//   pikafish.js / pikafish.wasm（小文件）→ 【网络优先】：在线时每次都回源拿
-//     最新字节，保证"刷新即用最新引擎"；离线时回退缓存兜底。
-//   pikafish.data（~50MB 确定性大文件）→ Cache First + 清单哈希校验：
-//     version.json 已"缓存击穿"，只把 data 与最新清单比对，NNUE 没变就秒用
-//     缓存（不重下 51MB），变了才走流式续传下载。
+//   .js / .wasm（小文件）→ 网络优先；离线回退缓存。
+//   .data（~50MB）       → Cache First + 清单 sha256 校验；命中即秒用，
+//                          过期才走单会话流式下载。
 // ----------------------------------------------------------------------------
 async function cacheFirstEngine(event, req, url, cache) {
 
-    // ---- pikafish.data：大文件，Cache First + 哈希校验 ----
-    // 关键：不再用 SW 内存 ReadableStream 给引擎 worker 流式整份 .data。
-    // （Chromium 对 SW 源头流式响应在页面刷新/异常中断后可能"永久悬挂"——
-    //   worker 的 reader.read() 既不返回数据也不报错，进度一直 0%，只能清浏览数据恢复。
-    //   这正是之前"刷新多次后卡 0、怎么刷新都好不了"的根因。）
-    // 改为：缓存命中且哈希匹配 → 原子返回整份缓存（可靠、秒开、绝不悬挂）；
-    //        缓存过期 / 缺失 → 用"浏览器管理的网络 passthrough"直接流式给 worker，
-    //        进度实时可见，刷新即干净地重新开始，绝不复用悬挂流。
+    // ---- .data：大文件 ----
     if (url.pathname === DATA_PATH) {
         return getDataResponse(event, req, url, cache);
     }
 
-    // ---- pikafish.js / pikafish.wasm：小文件，网络优先 ----
+    // ---- .js / .wasm：小文件，网络优先 ----
+    const cacheKey = normalizeCacheKey(url);      // ★ D：规范化缓存键
     try {
         const fresh = await fetch(req, { cache: "reload" });
         if (fresh && fresh.ok && fresh.type === "basic") {
@@ -205,7 +224,7 @@ async function cacheFirstEngine(event, req, url, cache) {
                     headers.delete("Content-Length");
                     headers.delete("Set-Cookie");
                     const buf = await fresh.clone().arrayBuffer();
-                    await cache.put(req, new Response(buf, {
+                    await cache.put(cacheKey, new Response(buf, {
                         status: fresh.status,
                         statusText: fresh.statusText,
                         headers: headers
@@ -214,27 +233,25 @@ async function cacheFirstEngine(event, req, url, cache) {
             })();
             return withIsolationHeaders(fresh); // 本次就用网络最新字节
         }
-        const cached = await cache.match(req);
+        const cached = await cache.match(cacheKey);
         if (cached) return withIsolationHeaders(cached);
         return withIsolationHeaders(fresh);
     } catch (e) {
-        const cached = await cache.match(req);
+        const cached = await cache.match(cacheKey);
         if (cached) return withIsolationHeaders(cached);
         return new Response(null, { status: 504, statusText: "Network Unavailable" });
     }
 }
 
 // ----------------------------------------------------------------------------
-// 后台缓存：把一份网络响应整份写入 CacheStorage。
-//   浏览器管理的网络响应 clone() 后两路互相独立：worker 读实时字节这一路，
-//   写缓存这路并行完成。worker 中断/刷新不影响本路，也不会悬挂（区别于用手工
-//   tee/自建 SW 内存流去"多播"，后者在刷新中断后会产生永久悬挂的流）。
+// 后台缓存：把一份网络响应整份写入 CacheStorage（浏览器管理的 clone 双路，
+// 与"SW 内存流多播"不同，刷新中断后不会悬挂）。
 // ----------------------------------------------------------------------------
 async function backgroundCacheData(resp, storeHref, fetchPath, metaKey, cache) {
     try {
-        const buf = await resp.arrayBuffer(); // 读取整份（实时网络下载）
+        const buf = await resp.arrayBuffer();
         const headers = new Headers(resp.headers);
-        headers.delete("Content-Encoding"); // body 已是解压后的原始字节
+        headers.delete("Content-Encoding");
         headers.delete("Content-Length");
         headers.delete("Set-Cookie");
         await cache.put(storeHref, new Response(buf, {
@@ -242,7 +259,6 @@ async function backgroundCacheData(resp, storeHref, fetchPath, metaKey, cache) {
             statusText: resp.statusText || "OK",
             headers: headers
         }));
-        // 大文件 data 额外记录 sha256 到 meta（版本化键），供下次秒级校验命中缓存。
         if (fetchPath === DATA_PATH) {
             const sha = await sha256Hex(new Uint8Array(buf));
             await cache.put(metaKey, new Response(sha, {
@@ -254,32 +270,30 @@ async function backgroundCacheData(resp, storeHref, fetchPath, metaKey, cache) {
 }
 
 // ----------------------------------------------------------------------------
-// 网络优先（用于 version.json 与导航文档）：成功写缓存返回，失败回退缓存。
+// 网络优先（version.json 与导航文档）：成功写缓存返回，失败回退缓存。
 // ----------------------------------------------------------------------------
-async function networkFirst(req, cache) {
+async function networkFirst(req, url, cache) {
+    const cacheKey = normalizeCacheKey(url);      // ★ D：导航也规范化（去掉 query）
     try {
         const fresh = await fetch(req, { cache: "reload" });
         if (fresh && fresh.ok && fresh.type === "basic") {
-            await cache.put(req, fresh.clone()).catch(function () {});
+            await cache.put(cacheKey, fresh.clone()).catch(function () {});
             return withIsolationHeaders(fresh);
         }
-        const cached = await cache.match(req);
+        const cached = await cache.match(cacheKey);
         if (cached) return withIsolationHeaders(cached);
         return withIsolationHeaders(fresh);
     } catch (e) {
-        const cached = await cache.match(req);
+        const cached = await cache.match(cacheKey);
         if (cached) return withIsolationHeaders(cached);
         return new Response(null, { status: 504, statusText: "Network Unavailable" });
     }
 }
 
 // ----------------------------------------------------------------------------
-// 清单（version.json）：同一加载周期内并发请求合并为单次回源；失败退回缓存清单。
+// 清单（version.json）：短 TTL + 并发合并；失败退回缓存清单。
 //   version.json 结构：{ engineVersion, updatedAt, files: { path: { sha256, size } } }
 // ----------------------------------------------------------------------------
-let manifestInflight = null;
-
-// 取某文件的期望 sha256；旧版扁平结构或字段缺失时返回 undefined（回退缓存）。
 function manifestSha(manifest, path) {
     try {
         const e = manifest && manifest.files && manifest.files[path];
@@ -288,22 +302,35 @@ function manifestSha(manifest, path) {
 }
 
 function getManifest(cache) {
+    // ★ E：TTL 内直接返回，避免同一次页面加载内多次资源请求各触发一次回源。
+    const now = Date.now();
+    if (manifestCached.value && now - manifestCached.at < MANIFEST_TTL) {
+        return Promise.resolve(manifestCached.value);
+    }
     if (manifestInflight) return manifestInflight;
     manifestInflight = loadManifest(cache).then(
-        function (v) { manifestInflight = null; return v; },
-        function () { manifestInflight = null; return null; }
+        function (v) {
+            manifestInflight = null;
+            if (v) manifestCached = { value: v, at: Date.now() };
+            return v;
+        },
+        function () {
+            manifestInflight = null;
+            return null;
+        }
     );
     return manifestInflight;
 }
 
 async function loadManifest(cache) {
     try {
-        // 带时间戳 query + cache:reload：确保拿到的永远是服务器最新清单，
-        // 不受浏览器 HTTP 缓存 / GitHub Pages CDN 滞后影响。
+        // 带时间戳 query + cache:reload：确保拿到服务器最新清单，
+        // 不受 HTTP 缓存 / CDN 滞后影响。
         const fresh = await fetch(MANIFEST_PATH + "?v=" + Date.now(), { cache: "reload" });
         if (fresh && fresh.ok && fresh.type === "basic") {
             const data = await fresh.json().catch(function () { return null; });
             if (data) {
+                // 缓存键固定为 /version.json（不带 query），后续 match 也用同一键。
                 await cache.put(MANIFEST_PATH, fresh.clone()).catch(function () {});
                 return data;
             }
@@ -325,26 +352,22 @@ async function readStoredSha(cache, metaKey) {
 }
 
 // ============================================================================
-// .data 大文件统一下载：单实例下载会话 + 实时扇出。
-//   同时解决两个问题：
-//   [1] 刷新并发多份 51MB 抢占带宽（越刷越慢、贴近 0、只能开新页才恢复）——
-//       同一时刻【只有一个】下载会话，绝不重复回源。
-//   [2] 下载途中刷新，新页面只能干等缓存、进度一直 0——会话把实时字节【扇出】给所有
-//       页面，刷新后新页面立刻订阅同一份下载，进度从当前位置继续走（不再退回 0）。
-//   这一份下载由 SW 亲自读：分批交给所有订阅页面（实时进度），读完把整份原子写入
-//   CacheStorage 供下次秒开。用 event.waitUntil(session.done) 兜住，保证刷新期间
-//   下载也不会被打断（SW 不会提前终止）。
+// .data 大文件：单实例下载会话 + 实时扇出
+//
+//   ① 同一时刻只有一个下载会话，绝不并发多份 51MB。
+//   ② 会话把已下载字节缓存在 chunks 中，所有订阅者【从头】读，
+//      刷新 / 切后台返回时复用同一会话，进度延续、不重下。
+//   ③ event.waitUntil(session.done) 兜住会话生命周期，SW 不会提前终止。
 // ============================================================================
-let dataSession = null;
 
-// 尝试提供 .data 缓存。storeHref/metaKey 是“当前引擎版本”对应的键：
-//   命中该版本的缓存且 sha 与最新清单一致 → 返回；否则返回 null。
-// 校验用的期望哈希始终对应该版本的清单项 /wasm/pikafish.data。
+// ----------------------------------------------------------------------------
+// ★ A（核心修复）：过期时同时清磁盘 + 内存
+// ----------------------------------------------------------------------------
 async function tryServeDataFromCache(storeHref, metaKey, fetchPath, cache) {
     const cached = await cache.match(storeHref);
     if (!cached) return null;
     try {
-        const manifest = await getManifest(cache); // 最新清单（缓存击穿）
+        const manifest = await getManifest(cache);
         const expected = manifest ? manifestSha(manifest, fetchPath) : undefined;
         if (expected) {
             let stored = await readStoredSha(cache, metaKey);
@@ -357,8 +380,17 @@ async function tryServeDataFromCache(storeHref, metaKey, fetchPath, cache) {
                     })).catch(function () {});
                 }
             }
-            if (stored === expected) return cached;          // 已最新：秒用
-            await cache.delete(storeHref).catch(function () {});   // 过期：删掉走回源
+            if (stored === expected) return cached;                 // 已最新：秒用
+
+            // ---------- 缓存过期：删磁盘 + 清内存 ----------
+            await cache.delete(storeHref).catch(function () {});
+
+            // ★ 关键：清掉同版本键上驻留的内存下载会话，否则
+            //   getDataResponse 里 `dataSession.storeHref === storeHref`
+            //   会把旧 NNUE 字节从头重放给引擎。
+            if (dataSession && dataSession.storeHref === storeHref) {
+                dataSession = null;
+            }
             return null;
         }
         return cached; // 拿不到清单：用缓存兜底
@@ -367,7 +399,7 @@ async function tryServeDataFromCache(storeHref, metaKey, fetchPath, cache) {
     }
 }
 
-// 把“已验证匹配”的响应沿用到当前版本键（用于把旧版未版本化缓存迁移过来，避免重下 51MB）。
+// 把"已验证匹配"的旧裸键缓存沿用到当前版本键（避免重下 51MB）。
 async function adoptCachedData(legacy, storeHref, metaKey, cache) {
     try {
         const buf = await legacy.clone().arrayBuffer();
@@ -382,25 +414,37 @@ async function adoptCachedData(legacy, storeHref, metaKey, cache) {
     }
 }
 
-// 清理不属于当前引擎版本的 .data 及其 meta（含旧版未版本化键），避免无界堆积。
+// ----------------------------------------------------------------------------
+// ★ B（修复）：pruneOldData 用 pathname 判断，不再恒假；
+//   并用绝对 URL 比较当前键，避免误删正在使用的条目。
+// ----------------------------------------------------------------------------
 async function pruneOldData(storeHref, metaKey, cache) {
     try {
+        const origin = self.location.origin;
+        const currentStore = new URL(storeHref, origin).href;
+        const currentMeta  = new URL(metaKey,   origin).href;
+
         const keys = await cache.keys();
         await Promise.all(keys.map(async function (r) {
-            const k = r.url;
+            const href = r.url;
+            let pathname;
+            try { pathname = new URL(href).pathname; } catch (e) { return; }
+
             let isDataEntry = false;
-            if (k.indexOf(DATA_PATH + "?") === 0) isDataEntry = true;                 // 版本化 data
-            else if (k === DATA_PATH) isDataEntry = true;                             // 旧裸 data
-            else if (k.lastIndexOf(DATA_META_PFX, 0) === 0) isDataEntry = true;       // 版本化 meta
-            else if (k === DATA_META_KEY) isDataEntry = true;                         // 旧 meta
-            if (isDataEntry && k !== storeHref && k !== metaKey) {
-                await cache.delete(k).catch(function () {});
+            if (pathname === DATA_PATH) isDataEntry = true;                     // /wasm/pikafish.data（?v= 时 pathname 仍是它）
+            else if (pathname === DATA_META_KEY) isDataEntry = true;            // /__meta/pikafish.data.sha256
+            else if (pathname.indexOf(DATA_META_PFX) === 0) isDataEntry = true; // /__meta/pikafish.data.<ver>.sha256
+
+            if (isDataEntry && href !== currentStore && href !== currentMeta) {
+                await cache.delete(href).catch(function () {});
             }
         }));
     } catch (e) { /* 清理失败不影响主流程 */ }
 }
 
-// 网络直通兜底（下载会话失败 / 极端竞态时用）：直接流式给 worker，后台并行写缓存。
+// ----------------------------------------------------------------------------
+// 网络直通兜底（下载会话失败 / 极端竞态）：直接流式给 worker，后台并行写缓存。
+// ----------------------------------------------------------------------------
 async function directPassthrough(event, req, fetchPath, storeHref, metaKey, cache) {
     try {
         const resp = await fetch(fetchPath, { cache: "reload" });
@@ -418,14 +462,10 @@ async function directPassthrough(event, req, fetchPath, storeHref, metaKey, cach
     }
 }
 
-// 同步创建唯一下载会话（构造函数无 await，保证并发请求原子地共享同一会话）。
-// 返回 session，其中：
-//   ready   promise —— 网络 fetch 结果确定（ok 的真假）；
-//   done    promise —— 整个下载 + 写缓存结束（无论成败）；
-//   ok     是否成功拿到网络流；
-//   loopDone  同步标记 —— 数据读取结束；
-//   chunks  共享字节缓冲（所有订阅者都从它【从头】读，保证每个页面拿到完整文件）；
-//   signal  唤醒信号 promise —— 有新数据 / 已结束时 resolve，供订阅者等待。
+// ----------------------------------------------------------------------------
+// 下载会话：SW 亲自读网络流，把 chunk 推入共享缓冲；所有订阅者从头读，
+// 保证刷新/切后台返回时都能拿到【从 0 到结尾的完整文件】。
+// ----------------------------------------------------------------------------
 function startDataSession(fetchPath, storeHref, metaKey, cache) {
     const session = {
         ready: null, resolveReady: null,
@@ -436,12 +476,11 @@ function startDataSession(fetchPath, storeHref, metaKey, cache) {
         expectedSize: 0,
         chunks: [],
         signal: null, resolveSignal: null,
-        subs: new Set(),
         storeHref: storeHref,
         metaKey: metaKey
     };
     session.ready = new Promise(function (r) { session.resolveReady = r; });
-    session.done = new Promise(function (r) { session.resolveDone = r; });
+    session.done  = new Promise(function (r) { session.resolveDone = r; });
     armSignal(session);
 
     (async function () {
@@ -453,13 +492,13 @@ function startDataSession(fetchPath, storeHref, metaKey, cache) {
                 return;
             }
             session.ok = true;
-            // 用清单里的 size 作为 Content-Length 基线（保证进度百分比正确）
+            // 用清单里的 size 作为 Content-Length 基线（进度百分比正确）
             try {
                 const m = await getManifest(cache);
                 const e = m && m.files && m.files[fetchPath];
                 session.expectedSize = (e && e.size) || 0;
             } catch (err) {}
-            session.resolveReady(); // 网络已通，订阅者可开始收数据
+            session.resolveReady();
 
             const reader = resp.body.getReader();
             let reachedEOF = false;
@@ -468,10 +507,10 @@ function startDataSession(fetchPath, storeHref, metaKey, cache) {
                 if (r.done) { reachedEOF = true; break; }
                 session.chunks.push(r.value);
                 total += r.value.byteLength;
-                kickSignal(session); // 唤醒所有等待的订阅者去读新一批数据
+                kickSignal(session); // 唤醒所有订阅者去读新一批数据
             }
-            // 仅当完整读到流末尾且字节数与清单期望一致才算完成；否则视为失败，
-            // 绝不把截断的文件交给引擎（避免读取 NNUE 越界 → memory access out of bounds）。
+            // 仅当完整读到流末尾、且字节数不短于清单期望才算完成；
+            // 否则视为失败，绝不把截断文件交给引擎（防 NNUE 越界）。
             if (reachedEOF && (session.expectedSize === 0 || total >= session.expectedSize)) {
                 session.completed = true;
                 await writeDataCache(storeHref, session.chunks, total, metaKey, cache);
@@ -479,7 +518,7 @@ function startDataSession(fetchPath, storeHref, metaKey, cache) {
         } catch (e) {
             // 网络中断等异常：交由 finally 收尾，订阅流读到已有数据后关闭
         } finally {
-            if (!session.completed && dataSession === session) dataSession = null; // 失败：下次请求重开新会话下载
+            if (!session.completed && dataSession === session) dataSession = null; // 失败：下次重开新会话
             session.loopDone = true;
             kickSignal(session);
             session.resolveDone();
@@ -489,7 +528,7 @@ function startDataSession(fetchPath, storeHref, metaKey, cache) {
     return session;
 }
 
-// 挂一个新的“信号”供订阅者等待；kickSignal 会 resolve 旧信号并换新。
+// 挂新"信号"供订阅者等待；kickSignal 会 resolve 旧信号并换新。
 function armSignal(session) {
     session.signal = new Promise(function (r) { session.resolveSignal = r; });
 }
@@ -499,8 +538,7 @@ function kickSignal(session) {
     if (rs) rs();
 }
 
-// 把内存中已下载的整份 .data 原子写入 CacheStorage（流式入缓存，避免二次拷贝大块内存）。
-// 写入用“当前引擎版本”对应的键 storeHref / metaKey。
+// 把内存中已下载的整份 .data 原子写入 CacheStorage。
 async function writeDataCache(storeHref, chunks, total, metaKey, cache) {
     let i = 0;
     const body = new ReadableStream({
@@ -529,8 +567,8 @@ async function writeDataCache(storeHref, chunks, total, metaKey, cache) {
 }
 
 // 订阅实时流：输出流在 pull 时从 session.chunks【从头】读取。
-// 数据随下载增长→每次 signal 唤醒后继续多发；下载结束(loopDone)→发完剩余后关闭。
-// 因此无论何时刷新加入，都能拿到【从 0 到结尾的完整文件】，进度也从当前位置续走。
+// 数据随下载增长 → 每次 signal 唤醒后继续多发；下载结束(loopDone) → 发完剩余后关闭。
+// 因此无论何时刷新加入，都能拿到【从 0 到结尾的完整文件】。
 function makeSubscriberStream(session) {
     const entry = { idx: 0 };
     return new ReadableStream({
@@ -551,45 +589,55 @@ function makeSubscriberStream(session) {
     });
 }
 
+// ----------------------------------------------------------------------------
+// .data 请求处理
+// ----------------------------------------------------------------------------
 async function getDataResponse(event, req, url, cache) {
-    // 解析当前引擎版本，构造与该版本绑定的缓存键（.data ↔ 引擎同版本，杜绝新旧错配）。
-    // 即使离线，getManifest 也会回退到缓存的清单，engineVersion 依然可得。
+    // 解析当前引擎版本，构造与该版本绑定的缓存键。
+    // 离线时 getManifest 会回退到缓存清单，engineVersion 依然可得。
     let version = null;
     try {
         const manifest = await getManifest(cache);
         if (manifest && typeof manifest.engineVersion === "string") version = manifest.engineVersion;
     } catch (e) { /* 拿不到版本则以未版本化键兜底 */ }
 
-    const storeHref = dataCacheKey(version);   // 当前版本缓存键
+    const storeHref = dataCacheKey(version);   // 当前版本缓存键（保留 ?v=）
     const metaKey   = dataMetaKey(version);    // 当前版本 meta 键
-    const fetchPath = url.pathname;            // 下载始终走真实路径（query 不影响字节）
+    const fetchPath = url.pathname;            // 下载始终走真实路径
 
-    // 1) 命中当前版本缓存且哈希一致 → 秒用，绝不重下
+    // 1) 命中当前版本缓存且哈希一致 → 秒用。
+    //    注意：tryServeDataFromCache 在"缓存过期并删除"时会同步清空
+    //    与之绑定的 dataSession（见该函数注释），保证下面第 2 步能开新会话。
     let fromCache = await tryServeDataFromCache(storeHref, metaKey, fetchPath, cache);
+
+    // 1.5) 旧版未版本化缓存：若其哈希仍与当前清单一致，直接沿用（不重下）。
     if (!fromCache) {
-        // 1.5) 旧版未版本化缓存：若其哈希仍与当前清单一致，直接沿用（避免重下 51MB）
         const legacy = await tryServeDataFromCache(DATA_PATH, DATA_META_KEY, fetchPath, cache);
         if (legacy) fromCache = await adoptCachedData(legacy, storeHref, metaKey, cache);
     }
+
+    // ★ C（修复）：无论本次命中还是走下载，都统一清一次旧版本残留。
+    //   - 命中分支：清上一版本的 ?v=old 与旧裸键（adopt 已完成，不会误删）；
+    //   - 下载分支：清上一版本残留，避免"发布后第一次打开"这条路径不清缓存，
+    //     导致旧的 51MB 滞留到下一次命中才清。
+    await pruneOldData(storeHref, metaKey, cache).catch(function () {});
+
     if (fromCache) {
-        await pruneOldData(storeHref, metaKey, cache).catch(function () {});
         return withIsolationHeaders(fromCache);
     }
 
-    // 2) 需要下载：原子共享唯一会话（同步构建，杜绝并发各自回源）；并钉住它的生命周期，
-    //    用 event.waitUntil 保证刷新期间 SW 不提前终止、下载不断。
-    //   ⚠️ 会话必须与当前引擎版本绑定：dataSession 是 SW 全局单例，若上一会话属于
-    //      别的版本（旧版本下载中、或完成后仍驻留内存），直接复用会把旧版本的 NNUE
-    //      字节流喂给当前打开的新版本引擎 —— 这正是“第一次打开只更新引擎、NNUE 仍是
-    //      旧的，需手动刷新才重下”的根因。只要请求的 storeHref 与现会话不一致，就为
-    //      当前版本开启新会话，保证引擎与 NNUE 在同一次打开内配套更新。
+    // 2) 需要下载：原子共享唯一会话；用 event.waitUntil 钉住生命周期。
+    //    ⚠️ 会话必须与当前引擎版本绑定：dataSession 是 SW 全局单例，
+    //       若它属于别的版本键，直接复用会把旧版本 NNUE 字节喂给新引擎。
+    //       结合 tryServeDataFromCache 的"过期清内存"修复：即使 engineVersion
+    //       未变、只有 NNUE 变了，dataSession 也会被清空 → 这里必然开新会话。
     if (!dataSession || dataSession.storeHref !== storeHref) {
         dataSession = startDataSession(fetchPath, storeHref, metaKey, cache);
     }
     const session = dataSession;
     event.waitUntil(session.done);
 
-    // 3) 等网络结果确定：成功可订阅；失败则走缓存 / 网络直通兜底
+    // 3) 等网络结果确定：成功可订阅；失败走缓存 / 网络直通兜底。
     await session.ready;
     if (!session.ok) {
         const fb = await cache.match(storeHref);
@@ -597,7 +645,7 @@ async function getDataResponse(event, req, url, cache) {
         return withIsolationHeaders(await directPassthrough(event, req, fetchPath, storeHref, metaKey, cache));
     }
 
-    // 4) 订阅实时流：输出流按需从共享缓冲【从头】读，下载完成即发满并关闭。
+    // 4) 订阅实时流。
     const headers = { "Content-Type": "application/octet-stream" };
     if (session.expectedSize > 0) headers["Content-Length"] = String(session.expectedSize);
     return withIsolationHeaders(new Response(makeSubscriberStream(session), {
@@ -608,7 +656,7 @@ async function getDataResponse(event, req, url, cache) {
 }
 
 // ----------------------------------------------------------------------------
-// 工具函数。
+// 工具函数
 // ----------------------------------------------------------------------------
 async function readAllBytes(body) {
     if (!body) return new Uint8Array(0);
@@ -635,7 +683,7 @@ async function sha256Hex(data) {
     }).join("");
 }
 
-// 注入跨源隔离头，保证 COOP/COEP 生效，使多线程引擎可正常运行。
+// 注入跨源隔离头，保证 COOP/COEP 生效，多线程引擎可正常运行。
 function withIsolationHeaders(response) {
     if (!response) return response;
     const status = response.status;
@@ -664,6 +712,11 @@ self.addEventListener("message", function (event) {
     if (d.type === "SKIP_WAITING") {
         self.skipWaiting();
     } else if (d.type === "CLEAR_CACHE") {
+        // ★ F：清缓存的同时清掉内存下载会话，避免正在进行的下载完成后
+        //      把数据重新写回缓存，让"清空"看起来不生效。
+        dataSession = null;
+        manifestInflight = null;
+        manifestCached = { value: null, at: 0 };
         event.waitUntil(
             caches.delete(CACHE_NAME)
                 .then(function () { return self.clients.matchAll(); })
