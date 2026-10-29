@@ -1,5 +1,5 @@
 {
-  "engineVersion": "29fe639",
+  "engineVersion": "e297a30",
   "files": {
     "/assets/ChessBoard.46291e70.js": {
       "sha256": "f832ef8254f774a7af3214842f28ba1755cc358cf2c4bd72050aeab33f75ef34",
@@ -50,21 +50,21 @@
       "size": 33500
     },
     "/wasm/pikafish.data": {
-      "sha256": "cd396741e9e0ffd22043216c5f8aed5d8960be6422ddefc4a5bc09a5344fec14",
-      "size": 50241164
+      "sha256": "810ef8ecb0d0697755deac0a1d956296d762132f63b74fc4f8658f2ec5203f5b",
+      "size": 50309463
     },
     "/wasm/pikafish.js": {
-      "sha256": "14c38b2a39fcaf28cf8cb475676de3bf65255df5c95210b88aba184e839cea54",
+      "sha256": "e34ac8da34377a68c6e2480404372f6ee8d161b36d8ffc1c95aa7a4e6de994ef",
       "size": 82488
     },
     "/wasm/pikafish.wasm": {
-      "sha256": "e5ad253767f1ae9231e792b2a6287601fa777066280efaf2eb8bff01ed060b07",
-      "size": 713536
+      "sha256": "1b29823ae4b3ba0254c4932b518537f2d65637a18a392ff7b667438a5f6eae45",
+      "size": 713234
     },
     "/xiangqiai.html": {
       "sha256": "a7d68b8a2829a69ac6b68a23a1068196b96023b25ec5ca01e3ee1d8ad9cf75fc",
       "size": 21039
     }
   },
-  "updatedAt": "2026-10-28T21:48:36+08:00"
+  "updatedAt": "2026-10-29T22:18:03+08:00"
 }
